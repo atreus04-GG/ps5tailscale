@@ -77,7 +77,7 @@ On your phone or computer:
 
 1. Sign in to your Tailscale account.
 2. Open the Tailscale Admin Console.
-3. Go to the section for **Keys / Auth Keys**.
+3. Go to the Settings > **Keys / Auth Keys**.
 4. Create a new auth key.
 5. Copy the key.
 
