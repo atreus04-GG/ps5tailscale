@@ -1,0 +1,1915 @@
+diff --git a/control/controlclient/direct.go b/control/controlclient/direct.go
+index d5cd6a1..8910483 100644
+--- a/control/controlclient/direct.go
++++ b/control/controlclient/direct.go
+@@ -704,6 +704,10 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
+ 	if err != nil {
+ 		return regen, opt.URL, nil, fmt.Errorf("getNoiseClient: %w", err)
+ 	}
++	if opt.URL != "" {
++		c.logf("[PS5 control] closing idle Noise connections before followup")
++		httpc.CloseIdleConnections()
++	}
+ 	url := fmt.Sprintf("%s/machine/register", c.serverURL)
+ 	url = strings.Replace(url, "http:", "https:", 1)
+ 
+@@ -711,17 +715,40 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
+ 	if err != nil {
+ 		return regen, opt.URL, nil, err
+ 	}
+-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyData))
++	reqCtx := ctx
++	if opt.URL != "" {
++		var cancel context.CancelFunc
++		reqCtx, cancel = context.WithTimeout(ctx, 15*time.Second)
++		defer cancel()
++		c.logf("[PS5 control] followup request timeout=15s")
++		go func(nc *ts2021.Client, timeoutCtx context.Context) {
++			<-timeoutCtx.Done()
++			if !errors.Is(timeoutCtx.Err(), context.DeadlineExceeded) {
++				return
++			}
++			c.logf("[PS5 control] followup deadline reached; force closing Noise client")
++			_ = nc.Close()
++			c.mu.Lock()
++			if c.noiseClient == nc {
++				c.noiseClient = nil
++			}
++			c.mu.Unlock()
++		}(httpc, reqCtx)
++	}
++	req, err := http.NewRequestWithContext(reqCtx, "POST", url, bytes.NewReader(bodyData))
+ 	if err != nil {
+ 		return regen, opt.URL, nil, err
+ 	}
+ 	ts2021.AddLBHeader(req, request.OldNodeKey)
+ 	ts2021.AddLBHeader(req, request.NodeKey)
+ 
++	c.logf("[PS5 control] before register http Do followup=%v", opt.URL != "")
+ 	res, err := httpc.Do(req)
++	c.logf("[PS5 control] register http Do returned followup=%v err=%v", opt.URL != "", err)
+ 	if err != nil {
+ 		return regen, opt.URL, nil, fmt.Errorf("register request: %w", err)
+ 	}
++	c.logf("[PS5 control] register http status followup=%v status=%d", opt.URL != "", res.StatusCode)
+ 	if res.StatusCode != 200 {
+ 		msg, _ := io.ReadAll(res.Body)
+ 		res.Body.Close()
+@@ -729,10 +756,12 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
+ 			res.StatusCode, strings.TrimSpace(string(msg)))
+ 	}
+ 	resp := tailcfg.RegisterResponse{}
++	c.logf("[PS5 control] before register response decode followup=%v", opt.URL != "")
+ 	if err := decode(res, &resp); err != nil {
+ 		c.logf("error decoding RegisterResponse with server key %s and machine key %s: %v", serverKey, machinePrivKey.Public(), err)
+ 		return regen, opt.URL, nil, fmt.Errorf("register request: %v", err)
+ 	}
++	c.logf("[PS5 control] register response decode returned followup=%v authURL=%v machineAuthorized=%v", opt.URL != "", resp.AuthURL != "", resp.MachineAuthorized)
+ 	if DevKnob.DumpRegister() {
+ 		j, _ := json.MarshalIndent(resp, "", "\t")
+ 		c.logf("RegisterResponse: %s", j)
+diff --git a/control/controlhttp/client.go b/control/controlhttp/client.go
+index 06a2131..2d07a12 100644
+--- a/control/controlhttp/client.go
++++ b/control/controlhttp/client.go
+@@ -179,6 +179,21 @@ type dialResult struct {
+ // 443. Until one of Docker's proxy and/or this package's port 443 fallback is
+ // fixed, this is a workaround. It might also be useful for future debugging.
+ var forceNoise443 = envknob.RegisterBool("TS_FORCE_NOISE_443")
++var forceNoiseIPv4 = envknob.RegisterBool("TS_FORCE_NOISE_IPV4")
++var forceNoiseIPv4ForTest atomic.Bool
++var traceRawConnForTest atomic.Bool
++
++// SetForceNoiseIPv4ForTest forces control Noise underlay dials to IPv4.
++// It is used by the PS5 compatibility probe before starting tsnet.
++func SetForceNoiseIPv4ForTest(force bool) {
++	forceNoiseIPv4ForTest.Store(force)
++}
++
++// SetTraceRawConnForTest enables bounded byte-count-only tracing immediately
++// below the Noise layer. It is used only by the PS5 compatibility probe.
++func SetTraceRawConnForTest(trace bool) {
++	traceRawConnForTest.Store(trace)
++}
+ 
+ // forceNoise443 reports whether the controlclient noise dialer should always
+ // use HTTPS connections as its underlay connection (double crypto). This can
+@@ -339,6 +354,56 @@ type tryURLRes struct {
+ 	}
+ }
+ 
++type ps5RawTraceConn struct {
++	net.Conn
++	logf func(string, ...any)
++	seq  atomic.Uint32
++}
++
++func (c *ps5RawTraceConn) Read(p []byte) (n int, err error) {
++	id := c.seq.Add(1)
++	trace := id <= 256
++	timeouts := 0
++	for {
++		if runtime.GOOS == "freebsd" {
++			if err := c.Conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
++				return 0, err
++			}
++		}
++		if trace {
++			c.logf("[PS5 raw] op=%d Read waiting want=%d", id, len(p))
++		}
++		n, err = c.Conn.Read(p)
++		if runtime.GOOS == "freebsd" {
++			if ne, ok := err.(net.Error); ok && ne.Timeout() {
++				timeouts++
++				if trace && (timeouts <= 4 || timeouts%20 == 0) {
++					c.logf("[AUTH164 control] op=%d idle-timeout count=%d continuing established stream", id, timeouts)
++				}
++				continue
++			}
++			_ = c.Conn.SetReadDeadline(time.Time{})
++		}
++		if trace {
++			c.logf("[PS5 raw] op=%d Read returned n=%d err=%v", id, n, err)
++		}
++		return n, err
++	}
++}
++
++func (c *ps5RawTraceConn) Write(p []byte) (n int, err error) {
++	id := c.seq.Add(1)
++	trace := id <= 256
++	if trace {
++		c.logf("[PS5 raw] op=%d Write begin bytes=%d", id, len(p))
++	}
++	n, err = c.Conn.Write(p)
++	if trace {
++		c.logf("[PS5 raw] op=%d Write returned n=%d err=%v", id, n, err)
++	}
++	return n, err
++}
++
+ // dialURL attempts to connect to the given URL.
+ //
+ // If optAddr is valid, then no DNS is used and the connection will be made to the
+@@ -352,6 +417,10 @@ func (a *Dialer) dialURL(ctx context.Context, u *url.URL, optAddr netip.Addr, op
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if traceRawConnForTest.Load() {
++		a.logf("[PS5 raw] enabling raw underlay tracing")
++		netConn = &ps5RawTraceConn{Conn: netConn, logf: a.logf}
++	}
+ 	cbConn, err := cont(ctx, netConn)
+ 	if err != nil {
+ 		netConn.Close()
+@@ -423,6 +492,22 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, optAddr netip.Ad
+ 	} else {
+ 		dialer = stdDialer.DialContext
+ 	}
++	if forceNoiseIPv4() || forceNoiseIPv4ForTest.Load() {
++		baseDialer := dialer
++		if traceRawConnForTest.Load() {
++			net.SetPS5ConnectTraceForTest(func(stage string, fd int, err error) {
++				a.logf("[PS5 connect] stage=%s fd=%d err=%v", stage, fd, err)
++			})
++		}
++		dialer = func(ctx context.Context, network, address string) (net.Conn, error) {
++			a.logf("[PS5 control] forcing Noise underlay dial to tcp4 address=%s requestedNetwork=%s", address, network)
++			if runtime.GOOS == "freebsd" && traceRawConnForTest.Load() {
++				a.logf("[AUTH154 control] using raw blocking socket outside Go netpoll address=%s", address)
++				return ps5BlockingDialContext(ctx, "tcp4", address, a.logf)
++			}
++			return baseDialer(ctx, "tcp4", address)
++		}
++	}
+ 
+ 	if optACEHost != "" {
+ 		if !buildfeatures.HasACE {
+@@ -522,15 +607,28 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, optAddr netip.Ad
+ 	// eagerly transmitting from the server.
+ 	var lastConn syncs.AtomicValue[net.Conn]
+ 	trace := httptrace.ClientTrace{
+-		// Even though we only make a single HTTP request which should
+-		// require a single connection, the context (with the attached
+-		// trace configuration) might be used by our custom dialer to
+-		// make other HTTP requests (e.g. BootstrapDNS). We only care
+-		// about the last connection made, which should be the one to
+-		// the control server.
++		ConnectStart: func(network, addr string) {
++			a.logf("[PS5 httptrace] ConnectStart network=%s addr=%s", network, addr)
++		},
++		ConnectDone: func(network, addr string, err error) {
++			a.logf("[PS5 httptrace] ConnectDone network=%s addr=%s err=%v", network, addr, err)
++		},
++		TLSHandshakeStart: func() {
++			a.logf("[PS5 httptrace] TLSHandshakeStart")
++		},
++		TLSHandshakeDone: func(cs tls.ConnectionState, err error) {
++			a.logf("[PS5 httptrace] TLSHandshakeDone vers=0x%x cipher=0x%x err=%v", cs.Version, cs.CipherSuite, err)
++		},
+ 		GotConn: func(info httptrace.GotConnInfo) {
++			a.logf("[PS5 httptrace] GotConn reused=%v wasIdle=%v", info.Reused, info.WasIdle)
+ 			lastConn.Store(info.Conn)
+ 		},
++		WroteRequest: func(info httptrace.WroteRequestInfo) {
++			a.logf("[PS5 httptrace] WroteRequest err=%v", info.Err)
++		},
++		GotFirstResponseByte: func() {
++			a.logf("[PS5 httptrace] GotFirstResponseByte")
++		},
+ 	}
+ 	ctx = httptrace.WithClientTrace(ctx, &trace)
+ 	req := &http.Request{
+@@ -544,10 +642,13 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, optAddr netip.Ad
+ 	}
+ 	req = req.WithContext(ctx)
+ 
++	a.logf("[PS5 httptrace] RoundTrip begin scheme=%s host=%s", u.Scheme, u.Host)
+ 	resp, err := tr.RoundTrip(req)
++	a.logf("[PS5 httptrace] RoundTrip returned err=%v", err)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	a.logf("[PS5 httptrace] HTTP response status=%d", resp.StatusCode)
+ 
+ 	if resp.StatusCode != http.StatusSwitchingProtocols {
+ 		return nil, fmt.Errorf("unexpected HTTP response: %s", resp.Status)
+diff --git a/control/controlhttp/ps5_blocking_conn_freebsd.go b/control/controlhttp/ps5_blocking_conn_freebsd.go
+new file mode 100644
+index 0000000..a866831
+--- /dev/null
++++ b/control/controlhttp/ps5_blocking_conn_freebsd.go
+@@ -0,0 +1,255 @@
++//go:build freebsd
++
++package controlhttp
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"strconv"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"golang.org/x/sys/unix"
++)
++
++// ps5BlockingConn deliberately owns a raw socket that is never handed to
++// net.FileConn or internal/poll, so Go's kqueue netpoller never registers it.
++type ps5BlockingConn struct {
++	fd            int
++	laddr         net.Addr
++	raddr         net.Addr
++	logf          func(string, ...any)
++	close         sync.Once
++	deadlineMu    sync.Mutex
++	readDeadline  time.Time
++	writeDeadline time.Time
++	readYieldSeq  atomic.Uint32
++	writeYieldSeq atomic.Uint32
++}
++
++func auth174Backoff() {
++	req := unix.Timespec{Nsec: int64(time.Millisecond)}
++	var rem unix.Timespec
++	for {
++		err := unix.Nanosleep(&req, &rem)
++		if err != unix.EINTR {
++			return
++		}
++		req = rem
++	}
++}
++
++func ps5BlockingDialContext(ctx context.Context, network, address string, logf func(string, ...any)) (net.Conn, error) {
++	if network != "tcp4" && network != "tcp" {
++		return nil, fmt.Errorf("AUTH154 blocking dial only supports tcp4, got %q", network)
++	}
++	host, portText, err := net.SplitHostPort(address)
++	if err != nil {
++		return nil, err
++	}
++	ip := net.ParseIP(host).To4()
++	if ip == nil {
++		return nil, fmt.Errorf("AUTH154 blocking dial requires IPv4 literal: %q", host)
++	}
++	port, err := strconv.Atoi(portText)
++	if err != nil || port < 1 || port > 65535 {
++		return nil, fmt.Errorf("AUTH154 invalid port %q", portText)
++	}
++	select {
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	default:
++	}
++
++	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
++	if err != nil {
++		return nil, err
++	}
++	unix.CloseOnExec(fd)
++	logf("[AUTH163 control] socket-after fd=%d err=<nil>", fd)
++	sa := &unix.SockaddrInet4{Port: port}
++	copy(sa.Addr[:], ip)
++	if err := unix.SetNonblock(fd, true); err != nil {
++		unix.Close(fd)
++		return nil, err
++	}
++	logf("[AUTH163 control] connect-before fd=%d address=%s", fd, address)
++	err = unix.Connect(fd, sa)
++	logf("[AUTH163 control] connect-after fd=%d err=%v", fd, err)
++	if err != nil && err != unix.EINPROGRESS && err != unix.EALREADY && err != unix.EINTR && err != unix.EISCONN {
++		unix.Close(fd)
++		return nil, err
++	}
++	if err != nil && err != unix.EISCONN {
++		pollfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
++		for {
++			if err := ctx.Err(); err != nil {
++				unix.Close(fd)
++				return nil, err
++			}
++			timeoutMS := 100
++			if deadline, ok := ctx.Deadline(); ok {
++				remaining := time.Until(deadline)
++				if remaining <= 0 {
++					unix.Close(fd)
++					return nil, context.DeadlineExceeded
++				}
++				remainingMS := int((remaining + time.Millisecond - 1) / time.Millisecond)
++				if remainingMS < timeoutMS {
++					timeoutMS = remainingMS
++				}
++			}
++			pollfd[0].Revents = 0
++			logf("[AUTH163 control] poll-before fd=%d timeout_ms=%d", fd, timeoutMS)
++			n, pollErr := unix.Poll(pollfd, timeoutMS)
++			logf("[AUTH163 control] poll-after fd=%d n=%d revents=%d err=%v", fd, n, pollfd[0].Revents, pollErr)
++			if pollErr == unix.EINTR {
++				continue
++			}
++			if pollErr != nil {
++				unix.Close(fd)
++				return nil, pollErr
++			}
++			if n == 0 {
++				continue
++			}
++			soErr, getsockoptErr := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ERROR)
++			logf("[AUTH163 control] so-error fd=%d value=%d err=%v", fd, soErr, getsockoptErr)
++			if getsockoptErr != nil {
++				unix.Close(fd)
++				return nil, getsockoptErr
++			}
++			if soErr != 0 {
++				unix.Close(fd)
++				return nil, unix.Errno(soErr)
++			}
++			break
++		}
++	}
++	logf("[AUTH165 control] connected-nonblocking fd=%d", fd)
++
++	remote := &net.TCPAddr{IP: append(net.IP(nil), ip...), Port: port}
++	local := net.Addr(&net.TCPAddr{})
++	if lsa, err := unix.Getsockname(fd); err == nil {
++		if a, ok := lsa.(*unix.SockaddrInet4); ok {
++			local = &net.TCPAddr{IP: net.IPv4(a.Addr[0], a.Addr[1], a.Addr[2], a.Addr[3]), Port: a.Port}
++		}
++	}
++	return &ps5BlockingConn{fd: fd, laddr: local, raddr: remote, logf: logf}, nil
++}
++
++func (c *ps5BlockingConn) Read(p []byte) (int, error) {
++	for {
++		n, err := unix.Read(c.fd, p)
++		if n > 0 {
++			return n, err
++		}
++		if err == nil {
++			return 0, io.EOF
++		}
++		if err == unix.EINTR {
++			continue
++		}
++		if err != unix.EAGAIN && err != unix.EWOULDBLOCK {
++			return 0, err
++		}
++		_, expired := c.pollTimeout(true)
++		if expired {
++			return 0, unix.EAGAIN
++		}
++		seq := c.readYieldSeq.Add(1)
++		trace := seq <= 16
++		if trace {
++			c.logf("[AUTH174 control] read-backoff-before fd=%d seq=%d", c.fd, seq)
++		}
++		auth174Backoff()
++		if trace {
++			c.logf("[AUTH174 control] read-backoff-after fd=%d seq=%d", c.fd, seq)
++		}
++	}
++}
++
++func (c *ps5BlockingConn) Write(p []byte) (int, error) {
++	for {
++		n, err := unix.Write(c.fd, p)
++		if n > 0 {
++			return n, err
++		}
++		if err == nil {
++			return 0, nil
++		}
++		if err == unix.EINTR {
++			continue
++		}
++		if err != unix.EAGAIN && err != unix.EWOULDBLOCK {
++			return 0, err
++		}
++		_, expired := c.pollTimeout(false)
++		if expired {
++			return 0, unix.EAGAIN
++		}
++		seq := c.writeYieldSeq.Add(1)
++		trace := seq <= 16
++		if trace {
++			c.logf("[AUTH174 control] write-backoff-before fd=%d seq=%d", c.fd, seq)
++		}
++		auth174Backoff()
++		if trace {
++			c.logf("[AUTH174 control] write-backoff-after fd=%d seq=%d", c.fd, seq)
++		}
++	}
++}
++
++func (c *ps5BlockingConn) Close() error {
++	var err error
++	c.close.Do(func() { err = unix.Close(c.fd) })
++	return err
++}
++
++func (c *ps5BlockingConn) LocalAddr() net.Addr  { return c.laddr }
++func (c *ps5BlockingConn) RemoteAddr() net.Addr { return c.raddr }
++
++func (c *ps5BlockingConn) SetDeadline(t time.Time) error {
++	if err := c.SetReadDeadline(t); err != nil {
++		return err
++	}
++	return c.SetWriteDeadline(t)
++}
++
++func (c *ps5BlockingConn) pollTimeout(read bool) (timeoutMS int, expired bool) {
++	c.deadlineMu.Lock()
++	deadline := c.writeDeadline
++	if read {
++		deadline = c.readDeadline
++	}
++	c.deadlineMu.Unlock()
++	if deadline.IsZero() {
++		return 100, false
++	}
++	remaining := time.Until(deadline)
++	if remaining <= 0 {
++		return 0, true
++	}
++	remainingMS := int((remaining + time.Millisecond - 1) / time.Millisecond)
++	if remainingMS > 100 {
++		remainingMS = 100
++	}
++	return remainingMS, false
++}
++
++func (c *ps5BlockingConn) SetReadDeadline(t time.Time) error {
++	c.deadlineMu.Lock()
++	c.readDeadline = t
++	c.deadlineMu.Unlock()
++	return nil
++}
++
++func (c *ps5BlockingConn) SetWriteDeadline(t time.Time) error {
++	c.deadlineMu.Lock()
++	c.writeDeadline = t
++	c.deadlineMu.Unlock()
++	return nil
++}
+diff --git a/control/controlhttp/ps5_blocking_conn_stub.go b/control/controlhttp/ps5_blocking_conn_stub.go
+new file mode 100644
+index 0000000..1f586c6
+--- /dev/null
++++ b/control/controlhttp/ps5_blocking_conn_stub.go
+@@ -0,0 +1,14 @@
++//go:build !freebsd
++
++package controlhttp
++
++import (
++	"context"
++	"net"
++)
++
++func ps5BlockingDialContext(ctx context.Context, network, address string, logf func(string, ...any)) (net.Conn, error) {
++	_ = logf
++	var d net.Dialer
++	return d.DialContext(ctx, network, address)
++}
+diff --git a/control/ts2021/client.go b/control/ts2021/client.go
+index ca10b1d..ea0c351 100644
+--- a/control/ts2021/client.go
++++ b/control/ts2021/client.go
+@@ -254,15 +254,19 @@ func (nc *Client) dial(ctx context.Context) (*Conn, error) {
+ 		HealthTracker:   nc.opts.HealthTracker,
+ 		Clock:           tstime.StdClock{},
+ 	}
++	nc.logf("[PS5 noise] dial begin timeout=%v", timeout)
+ 	clientConn, err := chd.Dial(ctx)
+ 	if err != nil {
++		nc.logf("[PS5 noise] dial returned err=%v", err)
+ 		return nil, err
+ 	}
++	nc.logf("[PS5 noise] dial established")
+ 
+ 	nc.mu.Lock()
+ 
+ 	handle := set.NewHandle()
+ 	ncc := NewConn(clientConn.Conn, func() { nc.noteConnClosed(handle) })
++	ncc.logf = nc.logf
+ 	mak.Set(&nc.connPool, handle, ncc)
+ 
+ 	if nc.closed {
+@@ -279,6 +283,7 @@ func (nc *Client) dial(ctx context.Context) (*Conn, error) {
+ // should be removed from the live connPool (which is usually of size 0 or 1,
+ // except perhaps briefly 2 during a network failure and reconnect).
+ func (nc *Client) noteConnClosed(handle set.Handle) {
++	nc.logf("[PS5 noise] connection closed")
+ 	nc.mu.Lock()
+ 	defer nc.mu.Unlock()
+ 	nc.connPool.Delete(handle)
+diff --git a/control/ts2021/conn.go b/control/ts2021/conn.go
+index 52d6632..e2a0773 100644
+--- a/control/ts2021/conn.go
++++ b/control/ts2021/conn.go
+@@ -17,6 +17,7 @@
+ 
+ 	"tailscale.com/control/controlbase"
+ 	"tailscale.com/tailcfg"
++	"tailscale.com/types/logger"
+ )
+ 
+ // Conn is a wrapper around controlbase.Conn.
+@@ -30,6 +31,10 @@
+ // Otherwise making a Conn directly, only setting Conn, is fine.
+ type Conn struct {
+ 	*controlbase.Conn
++	logf       logger.Logf
++	h2TraceMu  sync.Mutex
++	h2TraceIn  h2FrameTraceState
++	h2TraceOut h2FrameTraceState
+ 
+ 	onClose           func()        // or nil
+ 	readHeaderOnce    sync.Once     // guards init of reader field
+@@ -51,6 +56,81 @@ func NewConn(conn *controlbase.Conn, onClose func()) *Conn {
+ 		Conn:              conn,
+ 		earlyPayloadReady: make(chan struct{}),
+ 		onClose:           sync.OnceFunc(onClose),
++		h2TraceOut:        h2FrameTraceState{prefaceRemaining: len("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")},
++	}
++}
++
++// h2FrameTraceState incrementally consumes HTTP/2 frame boundaries without
++// retaining or logging payload contents.
++type h2FrameTraceState struct {
++	prefaceRemaining int
++	header           [hdrLen]byte
++	headerN          int
++	payloadRemaining uint32
++}
++
++func h2FrameTypeName(t byte) string {
++	switch t {
++	case 0:
++		return "DATA"
++	case 1:
++		return "HEADERS"
++	case 2:
++		return "PRIORITY"
++	case 3:
++		return "RST_STREAM"
++	case 4:
++		return "SETTINGS"
++	case 5:
++		return "PUSH_PROMISE"
++	case 6:
++		return "PING"
++	case 7:
++		return "GOAWAY"
++	case 8:
++		return "WINDOW_UPDATE"
++	case 9:
++		return "CONTINUATION"
++	default:
++		return "UNKNOWN"
++	}
++}
++
++func (c *Conn) traceHTTP2Frames(direction string, state *h2FrameTraceState, p []byte) {
++	c.h2TraceMu.Lock()
++	defer c.h2TraceMu.Unlock()
++
++	if state.prefaceRemaining > 0 {
++		n := min(state.prefaceRemaining, len(p))
++		state.prefaceRemaining -= n
++		p = p[n:]
++		if state.prefaceRemaining == 0 && c.logf != nil {
++			c.logf("[PS5 h2] %s client preface complete", direction)
++		}
++	}
++	for len(p) > 0 {
++		if state.payloadRemaining > 0 {
++			n := min(int(state.payloadRemaining), len(p))
++			state.payloadRemaining -= uint32(n)
++			p = p[n:]
++			continue
++		}
++		n := min(hdrLen-state.headerN, len(p))
++		copy(state.header[state.headerN:], p[:n])
++		state.headerN += n
++		p = p[n:]
++		if state.headerN != hdrLen {
++			continue
++		}
++		length := uint32(state.header[0])<<16 | uint32(state.header[1])<<8 | uint32(state.header[2])
++		frameType := state.header[3]
++		flags := state.header[4]
++		streamID := binary.BigEndian.Uint32(state.header[5:]) & 0x7fffffff
++		if c.logf != nil {
++			c.logf("[PS5 h2] %s frame=%s type=%d flags=0x%02x stream=%d length=%d", direction, h2FrameTypeName(frameType), frameType, flags, streamID, length)
++		}
++		state.headerN = 0
++		state.payloadRemaining = length
+ 	}
+ }
+ 
+@@ -102,7 +182,33 @@ func (r returnErrReader) Read([]byte) (int, error) { return 0, r.err }
+ // depending on the server.
+ func (c *Conn) Read(p []byte) (n int, err error) {
+ 	c.readHeaderOnce.Do(c.readHeader)
+-	return c.reader.Read(p)
++	if c.logf != nil {
++		c.logf("[PS5 noise] Read waiting want=%d", len(p))
++	}
++	n, err = c.reader.Read(p)
++	if c.logf != nil {
++		c.logf("[PS5 noise] Read returned n=%d err=%v", n, err)
++	}
++	if n > 0 {
++		c.traceHTTP2Frames("IN", &c.h2TraceIn, p[:n])
++	}
++	return n, err
++}
++
++// Write implements io.Writer while preserving byte-count-only diagnostics for
++// the PS5 control-path investigation. It never logs payload contents.
++func (c *Conn) Write(p []byte) (n int, err error) {
++	if c.logf != nil {
++		c.logf("[PS5 noise] Write begin bytes=%d", len(p))
++	}
++	n, err = c.Conn.Write(p)
++	if c.logf != nil {
++		c.logf("[PS5 noise] Write returned n=%d err=%v", n, err)
++	}
++	if n > 0 {
++		c.traceHTTP2Frames("OUT", &c.h2TraceOut, p[:n])
++	}
++	return n, err
+ }
+ 
+ // Close closes the connection.
+diff --git a/control/ts2021/conn_ps5_test.go b/control/ts2021/conn_ps5_test.go
+new file mode 100644
+index 0000000..56d8dee
+--- /dev/null
++++ b/control/ts2021/conn_ps5_test.go
+@@ -0,0 +1,35 @@
++package ts2021
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++)
++
++func TestPS5HTTP2FrameTraceFragmented(t *testing.T) {
++	var logs []string
++	c := &Conn{
++		logf: func(format string, args ...any) {
++			logs = append(logs, fmt.Sprintf(format, args...))
++		},
++		h2TraceOut: h2FrameTraceState{prefaceRemaining: len("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")},
++	}
++	wire := append([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"),
++		0, 0, 3, 1, 4, 0, 0, 0, 1, 'a', 'b', 'c',
++		0, 0, 0, 0, 1, 0, 0, 0, 1)
++
++	c.traceHTTP2Frames("OUT", &c.h2TraceOut, wire[:27])
++	c.traceHTTP2Frames("OUT", &c.h2TraceOut, wire[27:35])
++	c.traceHTTP2Frames("OUT", &c.h2TraceOut, wire[35:])
++
++	got := strings.Join(logs, "\n")
++	for _, want := range []string{
++		"[PS5 h2] OUT client preface complete",
++		"frame=HEADERS type=1 flags=0x04 stream=1 length=3",
++		"frame=DATA type=0 flags=0x01 stream=1 length=0",
++	} {
++		if !strings.Contains(got, want) {
++			t.Fatalf("trace missing %q; got:\n%s", want, got)
++		}
++	}
++}
+diff --git a/derp/derp_client.go b/derp/derp_client.go
+index d28905c..0e0d983 100644
+--- a/derp/derp_client.go
++++ b/derp/derp_client.go
+@@ -493,7 +493,13 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
+ 		}
+ 	}()
+ 	for {
+-		c.nc.SetReadDeadline(time.Now().Add(timeout))
++		deadline := time.Now().Add(timeout)
++		c.logf("[PS5 derp] recvTimeout before SetReadDeadline timeout=%v", timeout)
++		err = c.nc.SetReadDeadline(deadline)
++		c.logf("[PS5 derp] recvTimeout SetReadDeadline returned err=%v", err)
++		if err != nil {
++			return nil, err
++		}
+ 
+ 		// Discard any peeked bytes from a previous Recv call.
+ 		if c.peeked != 0 {
+@@ -504,7 +510,9 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
+ 			c.peeked = 0
+ 		}
+ 
++		c.logf("[PS5 derp] ReadFrameHeader waiting")
+ 		t, n, err := ReadFrameHeader(c.br)
++		c.logf("[PS5 derp] ReadFrameHeader returned type=%v len=%d err=%v", t, n, err)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/derp/derphttp/derphttp_client.go b/derp/derphttp/derphttp_client.go
+index db56c4a..fed4bd7 100644
+--- a/derp/derphttp/derphttp_client.go
++++ b/derp/derphttp/derphttp_client.go
+@@ -54,6 +54,19 @@
+ // Recv will report the error and not retry, but subsequent calls to
+ // Send/Recv will completely re-establish the connection (unless Close
+ // has been called).
++type ps5TraceConn struct {
++	net.Conn
++	logf logger.Logf
++	label string
++}
++
++func (c *ps5TraceConn) Read(p []byte) (int, error) {
++	c.logf("[PS5 derp net] %s Read waiting want=%d", c.label, len(p))
++	n, err := c.Conn.Read(p)
++	c.logf("[PS5 derp net] %s Read returned n=%d err=%v", c.label, n, err)
++	return n, err
++}
++
+ type Client struct {
+ 	TLSConfig     *tls.Config        // optional; nil means default
+ 	HealthTracker *health.Tracker    // optional; used if non-nil only
+@@ -463,15 +476,19 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
+ 	var serverProtoVersion int
+ 	var tlsState *tls.ConnectionState
+ 	if c.useHTTPS() {
++		tcpConn = &ps5TraceConn{Conn: tcpConn, logf: c.logf, label: "tcp"}
+ 		tlsConn := c.tlsClient(tcpConn, node)
+ 		httpConn = tlsConn
+ 
+ 		// Force a handshake now (instead of waiting for it to
+ 		// be done implicitly on read/write) so we can check
+ 		// the ConnectionState.
++		c.logf("[AUTH143 derp] before TLS Handshake")
+ 		if err := tlsConn.Handshake(); err != nil {
++			c.logf("[AUTH143 derp] TLS Handshake error=%v", err)
+ 			return nil, 0, err
+ 		}
++		c.logf("[AUTH143 derp] after TLS Handshake")
+ 
+ 		// We expect to be using TLS 1.3 to our own servers, and only
+ 		// starting at TLS 1.3 are the server's returned certificates
+@@ -493,6 +510,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
+ 		httpConn = tcpConn
+ 	}
+ 
++	httpConn = &ps5TraceConn{Conn: httpConn, logf: c.logf, label: "http"}
+ 	brw := bufio.NewReadWriter(bufio.NewReader(httpConn), bufio.NewWriter(httpConn))
+ 	var derpClient *derp.Client
+ 
+@@ -524,20 +542,26 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
+ 		// can Hijack the request, but we signal with a special header
+ 		// that we don't want to deal with its HTTP response.
+ 		req.Header.Set(derp.FastStartHeader, "1") // suppresses the server's HTTP response
++		c.logf("[AUTH143 derp] fast-start before HTTP request write")
+ 		if err := req.Write(brw); err != nil {
+ 			return nil, 0, err
+ 		}
++		c.logf("[AUTH143 derp] fast-start after HTTP request write")
+ 		// No need to flush the HTTP request. the derp.Client's initial
+ 		// client auth frame will flush it.
+ 	} else {
++		c.logf("[AUTH143 derp] before HTTP upgrade write")
+ 		if err := req.Write(brw); err != nil {
+ 			return nil, 0, err
+ 		}
++		c.logf("[AUTH143 derp] after HTTP upgrade write; before flush")
+ 		if err := brw.Flush(); err != nil {
+ 			return nil, 0, err
+ 		}
++		c.logf("[AUTH143 derp] after HTTP upgrade flush; before ReadResponse")
+ 
+ 		resp, err := http.ReadResponse(brw.Reader, req)
++		c.logf("[AUTH143 derp] ReadResponse returned err=%v", err)
+ 		if err != nil {
+ 			return nil, 0, err
+ 		}
+@@ -547,12 +571,14 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
+ 			return nil, 0, fmt.Errorf("GET failed: %v: %s", err, b)
+ 		}
+ 	}
++	c.logf("[AUTH143 derp] before derp.NewClient")
+ 	derpClient, err = derp.NewClient(c.privateKey, httpConn, brw, c.logf,
+ 		derp.MeshKey(c.MeshKey),
+ 		derp.ServerPublicKey(serverPub),
+ 		derp.CanAckPings(c.canAckPings),
+ 		derp.IsProber(c.IsProber),
+ 	)
++	c.logf("[AUTH143 derp] after derp.NewClient err=%v", err)
+ 	if err != nil {
+ 		return nil, 0, err
+ 	}
+diff --git a/ipn/ipnlocal/local.go b/ipn/ipnlocal/local.go
+index 2f05a4d..f4ae567 100644
+--- a/ipn/ipnlocal/local.go
++++ b/ipn/ipnlocal/local.go
+@@ -236,7 +236,7 @@ type LocalBackend struct {
+ 	// for testing and graceful shutdown purposes.
+ 	goTracker goroutines.Tracker
+ 
+-	startOnce sync.Once // protects the one‑time initialization in [LocalBackend.Start]
++	startOnce sync.Once // protects the oneÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Ëœtime initialization in [LocalBackend.Start]
+ 
+ 	// extHost is the bridge between [LocalBackend] and the registered [ipnext.Extension]s.
+ 	// It may be nil in tests that use direct composite literal initialization of [LocalBackend]
+@@ -473,17 +473,22 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
+ 	if loginFlags&controlclient.LocalBackendStartKeyOSNeutral != 0 {
+ 		goos = ""
+ 	}
++	logf("[PS5 stage] NewLocalBackend before newProfileManager")
+ 	pm, err := newProfileManagerWithGOOS(store, logf, sys.HealthTracker.Get(), goos)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	logf("[PS5 stage] NewLocalBackend profileManager returned")
+ 	if sds, ok := store.(ipn.StateStoreDialerSetter); ok {
+ 		sds.SetDialer(dialer.SystemDial)
+ 	}
+ 
++	logf("[PS5 stage] before envknob.LogCurrent")
+ 	envknob.LogCurrent(logf)
++	logf("[PS5 stage] after envknob.LogCurrent")
+ 
+ 	ctx, cancel := context.WithCancelCause(context.Background())
++	logf("[PS5 stage] context created")
+ 	clock := tstime.StdClock{}
+ 
+ 	// Until we transition to a Running state, use a canceled context for
+@@ -498,6 +503,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
+ 			"tailscaled_approved_routes", "Number of approved network routes (e.g. by a subnet router)"),
+ 	}
+ 
++	logf("[PS5 stage] before LocalBackend struct init")
+ 	b := &LocalBackend{
+ 		ctx:                   ctx,
+ 		ctxCancel:             cancel,
+@@ -521,8 +527,11 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
+ 		captiveCancel:         nil, // so that we start checkCaptivePortalLoop when Running
+ 		needsCaptiveDetection: make(chan bool),
+ 	}
++	logf("[PS5 stage] LocalBackend struct initialized")
+ 
++	logf("[PS5 stage] before newNodeBackend")
+ 	nb := newNodeBackend(ctx, b.logf, b.sys.Bus.Get())
++	logf("[PS5 stage] newNodeBackend returned")
+ 	b.currentNodeAtomic.Store(nb)
+ 	nb.ready()
+ 
+@@ -532,48 +541,89 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
+ 		}
+ 	}
+ 
++	logf("[PS5 stage] before NewExtensionHost")
+ 	if b.extHost, err = NewExtensionHost(logf, b); err != nil {
+ 		return nil, fmt.Errorf("failed to create extension host: %w", err)
+ 	}
++	logf("[PS5 stage] NewExtensionHost returned")
+ 	b.pm.SetExtensionHost(b.extHost)
++	logf("[PS5 stage] SetExtensionHost returned")
+ 
++	logf("[PS5 stage] before registerSysPolicyWatch")
+ 	if b.unregisterSysPolicyWatch, err = b.registerSysPolicyWatch(); err != nil {
+ 		return nil, err
+ 	}
++	logf("[PS5 stage] registerSysPolicyWatch returned")
+ 	defer func() {
+ 		if err != nil {
+ 			b.unregisterSysPolicyWatch()
+ 		}
+ 	}()
+ 
++	logf("[PS5 stage] before sys.NetMon.Get")
+ 	netMon := sys.NetMon.Get()
+-	b.sockstatLogger, err = sockstatlog.NewLogger(logpolicy.LogsDir(logf), logf, logID, netMon, sys.HealthTracker.Get(), sys.Bus.Get())
+-	if err != nil {
+-		logf("error setting up sockstat logger: %v", err)
++	logf("[PS5 stage] sys.NetMon.Get returned")
++	logf("[PS5 stage] before logpolicy.LogsDir")
++	logsDir := logpolicy.LogsDir(logf)
++	logf("[PS5 stage] logpolicy.LogsDir returned path=%q", logsDir)
++	if runtime.GOOS == "freebsd" {
++		// PS5/Prospero: sockstatlog.NewLogger starts logtail's background uploader.
++		// Sockstat telemetry is not required for tsnet startup, and that background
++		// path stalls this PS5 port immediately after NewLogger returns.
++		logf("[PS5 stage] skipping sockstatlog.NewLogger on PS5")
++		b.sockstatLogger = nil
++	} else {
++		logf("[PS5 stage] before sockstatlog.NewLogger")
++		b.sockstatLogger, err = sockstatlog.NewLogger(logsDir, logf, logID, netMon, sys.HealthTracker.Get(), sys.Bus.Get())
++		logf("[PS5 stage] sockstatlog.NewLogger returned err=%v", err)
++		if err != nil {
++			logf("error setting up sockstat logger: %v", err)
++		}
+ 	}
+ 	// Enable sockstats logs only on non-mobile unstable builds
+-	if version.IsUnstableBuild() && !version.IsMobile() && b.sockstatLogger != nil {
++	logf("[PS5 stage] before version.IsUnstableBuild")
++	unstableBuild := version.IsUnstableBuild()
++	logf("[PS5 stage] version.IsUnstableBuild returned %v", unstableBuild)
++	logf("[PS5 stage] before version.IsMobile")
++	mobileBuild := version.IsMobile()
++	logf("[PS5 stage] version.IsMobile returned %v", mobileBuild)
++	if unstableBuild && !mobileBuild && b.sockstatLogger != nil {
++		logf("[PS5 stage] before sockstatLogger.SetLoggingEnabled")
+ 		b.sockstatLogger.SetLoggingEnabled(true)
++		logf("[PS5 stage] sockstatLogger.SetLoggingEnabled returned")
+ 	}
++	logf("[PS5 stage] sockstat version gate complete")
+ 
+ 	// Default filter blocks everything and logs nothing, until Start() is called.
++	logf("[PS5 stage] before filter.NewAllowNone")
+ 	noneFilter := filter.NewAllowNone(logf, &netipx.IPSet{})
++	logf("[PS5 stage] filter.NewAllowNone returned")
+ 	b.setFilter(noneFilter)
++	logf("[PS5 stage] b.setFilter returned")
+ 	b.e.SetJailedFilter(noneFilter)
++	logf("[PS5 stage] SetJailedFilter returned")
+ 
+ 	b.setTCPPortsIntercepted(nil)
++	logf("[PS5 stage] setTCPPortsIntercepted returned")
+ 
+ 	b.e.SetStatusCallback(b.setWgengineStatus)
++	logf("[PS5 stage] SetStatusCallback returned")
+ 
++	logf("[PS5 stage] before netMon.InterfaceState")
+ 	b.interfaceState = netMon.InterfaceState()
++	logf("[PS5 stage] netMon.InterfaceState returned")
+ 
+ 	// Call our linkChange code once with the current state.
+ 	// Following changes are triggered via the eventbus.
++	logf("[PS5 stage] before netmon.NewChangeDelta")
+ 	cd, err := netmon.NewChangeDelta(nil, b.interfaceState, false, false)
++	logf("[PS5 stage] netmon.NewChangeDelta returned err=%v", err)
+ 	if err != nil {
+ 		b.logf("[unexpected] setting initial netmon state failed: %v", err)
+ 	} else {
++		logf("[PS5 stage] before b.linkChange")
+ 		b.linkChange(cd)
++		logf("[PS5 stage] b.linkChange returned")
+ 	}
+ 
+ 	if buildfeatures.HasPeerAPIServer {
+@@ -1825,10 +1875,14 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
+ 		b.logf("Received auth URL: %.20v...", st.URL)
+ 		b.setAuthURLLocked(st.URL)
+ 	}
++	b.logf("[AUTH142 control] before stateMachineLocked")
+ 	b.stateMachineLocked()
++	b.logf("[AUTH142 control] after stateMachineLocked state=%v", b.state)
+ 	// This is currently (2020-07-28) necessary; conditionally disabling it is fragile!
+ 	// This is where netmap information gets propagated to router and magicsock.
++	b.logf("[AUTH142 control] before authReconfigLocked")
+ 	b.authReconfigLocked()
++	b.logf("[AUTH142 control] after authReconfigLocked")
+ }
+ 
+ type preferencePolicyInfo struct {
+@@ -5113,22 +5167,37 @@ func (b *LocalBackend) authReconfigLocked() {
+ 		priv = key.NodePrivate{}
+ 	}
+ 
++	b.logf("[AUTH142 reconfig] before WGCfg")
+ 	cfg, err := nmcfg.WGCfg(priv, nm, b.logf, flags, prefs.ExitNodeID())
++	b.logf("[AUTH142 reconfig] after WGCfg err=%v", err)
+ 	if err != nil {
+ 		b.logf("wgcfg: %v", err)
+ 		return
+ 	}
+ 
++	b.logf("[AUTH142 reconfig] before routerConfig")
+ 	oneCGNATRoute := shouldUseOneCGNATRoute(b.logf, b.sys.NetMon.Get(), b.sys.ControlKnobs(), version.OS())
+ 	rcfg := b.routerConfigLocked(cfg, prefs, oneCGNATRoute)
++	b.logf("[AUTH142 reconfig] after routerConfig")
+ 
++	b.logf("[AUTH142 reconfig] before engine.Reconfig")
++	if runtime.GOOS == "freebsd" {
++		b.logf("[AUTH192 reconfig] PS5 restoring engine.Reconfig side effects")
++	}
+ 	err = b.e.Reconfig(cfg, rcfg, dcfg)
++	b.logf("[AUTH142 reconfig] after engine.Reconfig err=%v", err)
+ 	if err == wgengine.ErrNoChanges {
+ 		return
+ 	}
+ 	b.logf("[v1] authReconfig: ra=%v dns=%v 0x%02x: %v", prefs.RouteAll(), prefs.CorpDNS(), flags, err)
+ 
+-	b.initPeerAPIListenerLocked()
++	b.logf("[AUTH142 reconfig] before initPeerAPIListener")
++	if runtime.GOOS == "freebsd" {
++		b.logf("[AUTH150 peerapi] PS5 diagnostic skipping initPeerAPIListenerLocked")
++	} else {
++		b.initPeerAPIListenerLocked()
++	}
++	b.logf("[AUTH142 reconfig] after initPeerAPIListener")
+ 	if buildfeatures.HasAppConnectors {
+ 		go b.goTracker.Go(b.readvertiseAppConnectorRoutes)
+ 	}
+@@ -5703,7 +5772,11 @@ func (b *LocalBackend) enterStateLocked(newState ipn.State) {
+ 	case ipn.Starting, ipn.NeedsMachineAuth:
+ 		b.authReconfigLocked()
+ 		// Needed so that UpdateEndpoints can run
+-		b.goTracker.Go(b.e.RequestStatus)
++		if runtime.GOOS == "freebsd" {
++			b.logf("[AUTH150 status] PS5 diagnostic skipping asynchronous engine RequestStatus")
++		} else {
++			b.goTracker.Go(b.e.RequestStatus)
++		}
+ 	case ipn.Running:
+ 		if feature.CanSystemdStatus {
+ 			var addrStrs []string
+@@ -7386,7 +7459,7 @@ func suggestExitNode(report *netcheck.Report, nb *nodeBackend, prevSuggestion ta
+ 		return suggestExitNodeUsingTrafficSteering(nb, allowList)
+ 	default:
+ 		// The control plane will always strip the `traffic-steering`
+-		// node attribute if it isn’t enabled for this tailnet, even if
++		// node attribute if it isnÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢t enabled for this tailnet, even if
+ 		// it is set in the policy file: tailscale/corp#34401
+ 		return suggestExitNodeUsingDERP(report, nb, prevSuggestion, selectRegion, selectNode, allowList)
+ 	}
+@@ -7544,7 +7617,7 @@ type nodeDistance struct {
+ 
+ // suggestExitNodeUsingTrafficSteering uses traffic steering priority scores to
+ // pick one of the best exit nodes. These priorities are provided by Control in
+-// the node’s [tailcfg.Location]. To be eligible for consideration, the node
++// the nodeÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢s [tailcfg.Location]. To be eligible for consideration, the node
+ // must have NodeAttrSuggestExitNode in its CapMap.
+ func suggestExitNodeUsingTrafficSteering(nb *nodeBackend, allowed set.Set[tailcfg.StableNodeID]) (apitype.ExitNodeSuggestionResponse, error) {
+ 	// TODO(sfllaw): Context needs to be plumbed down here to support
+diff --git a/ipn/ipnlocal/profiles.go b/ipn/ipnlocal/profiles.go
+index 7080e3c..4fc5000 100644
+--- a/ipn/ipnlocal/profiles.go
++++ b/ipn/ipnlocal/profiles.go
+@@ -948,8 +948,11 @@ func newProfileManagerWithGOOS(store ipn.StateStore, logf logger.Logf, ht *healt
+ 	} else if len(knownProfiles) == 0 && goos != "windows" && runtime.GOOS != "windows" {
+ 		// No known profiles, try a migration.
+ 		pm.dlogf("no known profiles; trying to migrate from legacy prefs")
++		pm.logf("[PS5 stage] before migrateFromLegacyPrefs")
+ 		if initialProfile, err = pm.migrateFromLegacyPrefs(pm.currentUserID); err != nil {
+-
++			pm.logf("[PS5 stage] migrateFromLegacyPrefs returned error: %v", err)
++		} else {
++			pm.logf("[PS5 stage] migrateFromLegacyPrefs returned success")
+ 		}
+ 	}
+ 	if !initialProfile.Valid() {
+@@ -959,28 +962,37 @@ func newProfileManagerWithGOOS(store ipn.StateStore, logf logger.Logf, ht *healt
+ 		}
+ 		initialProfile = pm.NewProfileForUser(initialUserID)
+ 	}
++	pm.logf("[PS5 stage] before SwitchToProfile")
+ 	if _, _, err := pm.SwitchToProfile(initialProfile); err != nil {
+ 		return nil, err
+ 	}
++	pm.logf("[PS5 stage] SwitchToProfile returned")
++	pm.logf("[PS5 stage] newProfileManager returning")
+ 	return pm, nil
+ }
+ 
+ func (pm *profileManager) migrateFromLegacyPrefs(uid ipn.WindowsUserID) (ipn.LoginProfileView, error) {
+ 	metricMigration.Add(1)
++	pm.logf("[PS5 stage] migrateFromLegacyPrefs entered")
+ 	sentinel, prefs, err := pm.loadLegacyPrefs(uid)
+ 	if err != nil {
+ 		metricMigrationError.Add(1)
+ 		return ipn.LoginProfileView{}, fmt.Errorf("load legacy prefs: %w", err)
+ 	}
++	pm.logf("[PS5 stage] loadLegacyPrefs returned; sentinel=%q persistValid=%v", sentinel, prefs.Persist().Valid())
+ 	pm.dlogf("loaded legacy preferences; sentinel=%q", sentinel)
++	pm.logf("[PS5 stage] before migration setProfilePrefs")
+ 	profile, err := pm.setProfilePrefs(&ipn.LoginProfile{LocalUserID: uid}, prefs, ipn.NetworkProfile{})
+ 	if err != nil {
+ 		metricMigrationError.Add(1)
+ 		return ipn.LoginProfileView{}, fmt.Errorf("migrating _daemon profile: %w", err)
+ 	}
++	pm.logf("[PS5 stage] migration setProfilePrefs returned; id=%q key=%q", profile.ID(), profile.Key())
+ 	pm.completeMigration(sentinel)
++	pm.logf("[PS5 stage] completeMigration returned")
+ 	pm.dlogf("completed legacy preferences migration with sentinel=%q", sentinel)
+ 	metricMigrationSuccess.Add(1)
++	pm.logf("[PS5 stage] migrateFromLegacyPrefs returning")
+ 	return profile, nil
+ }
+ 
+diff --git a/ipn/store/stores.go b/ipn/store/stores.go
+index bf175da..a201e6a 100644
+--- a/ipn/store/stores.go
++++ b/ipn/store/stores.go
+@@ -144,6 +144,7 @@ func TryWindowsAppDataMigration(logf logger.Logf, path string) string {
+ // FileStore is a StateStore that uses a JSON file for persistence.
+ type FileStore struct {
+ 	path string
++	logf logger.Logf
+ 
+ 	mu    sync.RWMutex
+ 	cache map[ipn.StateKey][]byte
+@@ -179,6 +180,7 @@ func NewFileStore(logf logger.Logf, path string) (ipn.StateStore, error) {
+ 			}
+ 			return &FileStore{
+ 				path:  path,
++				logf:  logf,
+ 				cache: map[ipn.StateKey][]byte{},
+ 			}, nil
+ 		}
+@@ -187,6 +189,7 @@ func NewFileStore(logf logger.Logf, path string) (ipn.StateStore, error) {
+ 
+ 	ret := &FileStore{
+ 		path:  path,
++		logf:  logf,
+ 		cache: map[ipn.StateKey][]byte{},
+ 	}
+ 	if err := json.Unmarshal(bs, &ret.cache); err != nil {
+@@ -211,15 +214,31 @@ func (s *FileStore) ReadState(id ipn.StateKey) ([]byte, error) {
+ func (s *FileStore) WriteState(id ipn.StateKey, bs []byte) error {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
++	if s.logf != nil {
++		s.logf("[PS5 store] WriteState begin key=%q valueBytes=%d", id, len(bs))
++	}
+ 	if bytes.Equal(s.cache[id], bs) {
++		if s.logf != nil {
++			s.logf("[PS5 store] WriteState unchanged key=%q", id)
++		}
+ 		return nil
+ 	}
+ 	s.cache[id] = bytes.Clone(bs)
+ 	bs, err := json.MarshalIndent(s.cache, "", "  ")
+ 	if err != nil {
++		if s.logf != nil {
++			s.logf("[PS5 store] WriteState marshal failed key=%q err=%v", id, err)
++		}
+ 		return err
+ 	}
+-	return atomicfile.WriteFile(s.path, bs, 0600)
++	if s.logf != nil {
++		s.logf("[PS5 store] WriteState before atomicfile key=%q fileBytes=%d", id, len(bs))
++	}
++	err = atomicfile.WriteFile(s.path, bs, 0600)
++	if s.logf != nil {
++		s.logf("[PS5 store] WriteState atomicfile returned key=%q err=%v", id, err)
++	}
++	return err
+ }
+ 
+ func (s *FileStore) All() iter.Seq2[ipn.StateKey, []byte] {
+diff --git a/logpolicy/logpolicy.go b/logpolicy/logpolicy.go
+index f749178..23fe30c 100644
+--- a/logpolicy/logpolicy.go
++++ b/logpolicy/logpolicy.go
+@@ -201,6 +201,13 @@ func (lg logWriter) Write(buf []byte) (int, error) {
+ // LogsDir returns the directory to use for log configuration and
+ // buffer storage.
+ func LogsDir(logf logger.Logf) string {
++	if runtime.GOOS == "freebsd" {
++		// PS5/Prospero is built as freebsd/amd64. Use the caller-managed
++		// writable data directory directly and avoid FreeBSD filesystem probes.
++		const d = "/data/tailscale"
++		logf("[PS5 stage] LogsDir using PS5 directory %q", d)
++		return d
++	}
+ 	if d := os.Getenv("TS_LOGS_DIR"); d != "" {
+ 		fi, err := os.Stat(d)
+ 		if err == nil && fi.IsDir() {
+diff --git a/tsnet/tsnet.go b/tsnet/tsnet.go
+index 6c840c3..2922699 100644
+--- a/tsnet/tsnet.go
++++ b/tsnet/tsnet.go
+@@ -377,22 +377,34 @@ func (s *Server) Start() error {
+ // Up connects the server to the tailnet and waits until it is running.
+ // On success it returns the current status, including a Tailscale IP address.
+ func (s *Server) Up(ctx context.Context) (*ipnstate.Status, error) {
++	s.logf("[PS5 up] entering Up")
+ 	lc, err := s.LocalClient() // calls Start
+ 	if err != nil {
+ 		return nil, fmt.Errorf("tsnet.Up: %w", err)
+ 	}
++	s.logf("[PS5 up] LocalClient returned")
+ 
++	s.logf("[PS5 up] before WatchIPNBus")
+ 	watcher, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("tsnet.Up: %w", err)
+ 	}
++	s.logf("[PS5 up] WatchIPNBus returned")
+ 	defer watcher.Close()
+ 
+ 	for {
++		s.logf("[PS5 up] before watcher.Next")
+ 		n, err := watcher.Next()
+ 		if err != nil {
+ 			return nil, fmt.Errorf("tsnet.Up: %w", err)
+ 		}
++		stateText := "<nil>"
++		if n.State != nil {
++			stateText = n.State.String()
++		}
++		s.logf("[PS5 up] notify state=%s loginFinished=%v browseURL=%v netMap=%v prefs=%v err=%v",
++			stateText, n.LoginFinished != nil, n.BrowseToURL != nil,
++			n.NetMap != nil, n.Prefs != nil, n.ErrMessage != nil)
+ 		if n.ErrMessage != nil {
+ 			return nil, fmt.Errorf("tsnet.Up: backend: %s", *n.ErrMessage)
+ 		}
+@@ -599,6 +611,12 @@ func (s *Server) start() (reterr error) {
+ 			// os.Executable() returns an error, so fall back to "tsnet" there
+ 			// too.
+ 			exe = "tsnet"
++		case "freebsd":
++			// PS5/Prospero is built as freebsd/amd64, but its sysctl-based
++			// os.Executable implementation returns ENOENT. This path is only
++			// used to derive defaults; the PS5 caller explicitly sets Dir and
++			// Hostname, so using the same fallback is safe.
++			exe = "tsnet"
+ 		default:
+ 			return err
+ 		}
+@@ -671,26 +689,41 @@ func (s *Server) start() (reterr error) {
+ 	if err != nil {
+ 		return err
+ 	}
++	tsLogf("[PS5 stage] userspace engine returned")
+ 	closePool.add(s.dialer)
++	tsLogf("[PS5 stage] before sys.Set(engine)")
+ 	sys.Set(eng)
++	tsLogf("[PS5 stage] after sys.Set(engine)")
+ 	sys.HealthTracker.Get().SetMetricsRegistry(sys.UserMetricsRegistry())
++	tsLogf("[PS5 stage] health metrics registry set")
+ 
+ 	// TODO(oxtoacart): do we need to support Taildrive on tsnet, and if so, how?
++	tsLogf("[PS5 stage] before netstack.Create")
+ 	ns, err := netstack.Create(tsLogf, sys.Tun.Get(), eng, sys.MagicSock.Get(), s.dialer, sys.DNSManager.Get(), sys.ProxyMapper())
+ 	if err != nil {
+ 		return fmt.Errorf("netstack.Create: %w", err)
+ 	}
++	tsLogf("[PS5 stage] netstack.Create returned")
++	tsLogf("[PS5 stage] before tun.Start")
+ 	sys.Tun.Get().Start()
++	tsLogf("[PS5 stage] after tun.Start")
+ 	sys.Set(ns)
++	tsLogf("[PS5 stage] netstack subsystem set")
+ 	ns.ProcessLocalIPs = true
++	tsLogf("[PS5 stage] ProcessLocalIPs set")
+ 	ns.ProcessSubnets = true
++	tsLogf("[PS5 stage] ProcessSubnets set")
+ 	ns.GetTCPHandlerForFlow = s.getTCPHandlerForFlow
++	tsLogf("[PS5 stage] TCP handler set")
+ 	ns.GetUDPHandlerForFlow = s.getUDPHandlerForFlow
++	tsLogf("[PS5 stage] UDP handler set")
+ 	s.netstack = ns
++	tsLogf("[PS5 stage] s.netstack assigned")
+ 	s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
+ 		_, ok := eng.PeerForIP(ip)
+ 		return ok
+ 	}
++	tsLogf("[PS5 stage] UseNetstackForIP closure assigned")
+ 	s.dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+ 		// Note: don't just return ns.DialContextTCP or we'll return
+ 		// *gonet.TCPConn(nil) instead of a nil interface which trips up
+@@ -703,6 +736,7 @@ func (s *Server) start() (reterr error) {
+ 		}
+ 		return tcpConn, nil
+ 	}
++	tsLogf("[PS5 stage] NetstackDialTCP closure assigned")
+ 	s.dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+ 		// Note: don't just return ns.DialContextUDP or we'll return
+ 		// *gonet.UDPConn(nil) instead of a nil interface which trips up
+@@ -715,32 +749,46 @@ func (s *Server) start() (reterr error) {
+ 		}
+ 		return udpConn, nil
+ 	}
++	tsLogf("[PS5 stage] NetstackDialUDP closure assigned")
+ 
+ 	if s.Store == nil {
++		tsLogf("[PS5 stage] before filepath.Join state path")
+ 		stateFile := filepath.Join(s.rootPath, "tailscaled.state")
+-		s.logf("tsnet running state path %s", stateFile)
++		tsLogf("[PS5 stage] state path=%s", stateFile)
++		tsLogf("[PS5 stage] before store.New")
+ 		s.Store, err = store.New(tsLogf, stateFile)
+ 		if err != nil {
+ 			return err
+ 		}
++		tsLogf("[PS5 stage] store.New returned")
+ 	}
+ 	sys.Set(s.Store)
++	tsLogf("[PS5 stage] state store subsystem set")
+ 
+ 	loginFlags := controlclient.LoginDefault
+ 	if s.Ephemeral {
+ 		loginFlags = controlclient.LoginEphemeral
+ 	}
++	tsLogf("[PS5 stage] before NewLocalBackend")
+ 	lb, err := ipnlocal.NewLocalBackend(tsLogf, s.logid, sys, loginFlags|controlclient.LocalBackendStartKeyOSNeutral)
+ 	if err != nil {
+ 		return fmt.Errorf("NewLocalBackend: %v", err)
+ 	}
++	tsLogf("[PS5 stage] NewLocalBackend returned")
++	tsLogf("[PS5 stage] before SetTCPHandlerForFunnelFlow")
+ 	lb.SetTCPHandlerForFunnelFlow(s.getTCPHandlerForFunnelFlow)
++	tsLogf("[PS5 stage] SetTCPHandlerForFunnelFlow returned")
++	tsLogf("[PS5 stage] before SetVarRoot")
+ 	lb.SetVarRoot(s.rootPath)
+-	s.logf("tsnet starting with hostname %q, varRoot %q", s.hostname, s.rootPath)
++	tsLogf("[PS5 stage] SetVarRoot returned")
++	tsLogf("[PS5 stage] tsnet starting with hostname %q, varRoot %q", s.hostname, s.rootPath)
+ 	s.lb = lb
++	tsLogf("[PS5 stage] s.lb assigned")
++	tsLogf("[PS5 stage] before netstack.Start")
+ 	if err := ns.Start(lb); err != nil {
+ 		return fmt.Errorf("failed to start netstack: %w", err)
+ 	}
++	tsLogf("[PS5 stage] netstack.Start returned")
+ 	closePool.addFunc(func() { s.lb.Shutdown() })
+ 	prefs := ipn.NewPrefs()
+ 	prefs.Hostname = s.hostname
+@@ -748,10 +796,13 @@ func (s *Server) start() (reterr error) {
+ 	prefs.ControlURL = s.ControlURL
+ 	prefs.RunWebClient = s.RunWebClient
+ 	prefs.AdvertiseTags = s.AdvertiseTags
++	tsLogf("[PS5 stage] before resolveAuthKey")
+ 	authKey, err := s.resolveAuthKey()
+ 	if err != nil {
+ 		return fmt.Errorf("error resolving auth key: %w", err)
+ 	}
++	tsLogf("[PS5 stage] resolveAuthKey returned; empty=%v", authKey == "")
++	tsLogf("[PS5 stage] before LocalBackend.Start")
+ 	err = lb.Start(ipn.Options{
+ 		UpdatePrefs: prefs,
+ 		AuthKey:     authKey,
+@@ -759,18 +810,24 @@ func (s *Server) start() (reterr error) {
+ 	if err != nil {
+ 		return fmt.Errorf("starting backend: %w", err)
+ 	}
++	tsLogf("[PS5 stage] LocalBackend.Start returned")
+ 	st := lb.State()
++	tsLogf("[PS5 stage] LocalBackend state=%v", st)
+ 	if st == ipn.NeedsLogin || envknob.Bool("TSNET_FORCE_LOGIN") {
+-		s.logf("LocalBackend state is %v; running StartLoginInteractive...", st)
++		tsLogf("[PS5 stage] LocalBackend state is %v; running StartLoginInteractive...", st)
++		tsLogf("[PS5 stage] before StartLoginInteractive")
+ 		if err := s.lb.StartLoginInteractive(s.shutdownCtx); err != nil {
+ 			return fmt.Errorf("StartLoginInteractive: %w", err)
+ 		}
++		tsLogf("[PS5 stage] StartLoginInteractive returned")
+ 	} else if authKey != "" {
+ 		s.logf("Authkey is set; but state is %v. Ignoring authkey. Re-run with TSNET_FORCE_LOGIN=1 to force use of authkey.", st)
+ 	}
+ 	go s.printAuthURLLoop()
++	tsLogf("[PS5 stage] auth URL loop launched")
+ 
+ 	// Run the localapi handler, to allow fetching LetsEncrypt certs.
++	tsLogf("[PS5 stage] before localapi.NewHandler")
+ 	lah := localapi.NewHandler(localapi.HandlerConfig{
+ 		Actor:    ipnauth.Self,
+ 		Backend:  lb,
+@@ -780,10 +837,13 @@ func (s *Server) start() (reterr error) {
+ 	})
+ 	lah.PermitWrite = true
+ 	lah.PermitRead = true
++	tsLogf("[PS5 stage] localapi.NewHandler returned")
+ 
+ 	// Create an in-process listener.
+ 	// nettest.Listen provides a in-memory pipe based implementation for net.Conn.
++	tsLogf("[PS5 stage] before memnet.Listen")
+ 	lal := memnet.Listen("local-tailscaled.sock:80")
++	tsLogf("[PS5 stage] memnet.Listen returned")
+ 	s.localAPIListener = lal
+ 	s.localClient = &local.Client{Dial: lal.Dial}
+ 	s.localAPIServer = &http.Server{Handler: lah}
+@@ -794,6 +854,7 @@ func (s *Server) start() (reterr error) {
+ 		}
+ 	}()
+ 	closePool.add(s.localAPIListener)
++	tsLogf("[PS5 stage] tsnet.start returning success")
+ 	return nil
+ }
+ 
+diff --git a/wgengine/magicsock/derp.go b/wgengine/magicsock/derp.go
+index 1c5225e..8b4ab96 100644
+--- a/wgengine/magicsock/derp.go
++++ b/wgengine/magicsock/derp.go
+@@ -374,6 +374,7 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
+ 
+ 	// Note that derphttp.NewRegionClient does not dial the server
+ 	// (it doesn't block) so it is safe to do under the c.mu lock.
++	c.logf("[PS5 derp identity] creating region=%d localNode=%s peer=%s", regionID, c.privateKey.Public().ShortString(), peer.ShortString())
+ 	dc := derphttp.NewRegionClient(c.privateKey, c.logf, c.netMon, func() *tailcfg.DERPRegion {
+ 		// Warning: it is not legal to acquire
+ 		// magicsock.Conn.mu from this callback.
+@@ -436,7 +437,14 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
+ 
+ 	go c.runDerpReader(ctx, regionID, dc, wg, startGate)
+ 	go c.runDerpWriter(ctx, dc, ch, wg, startGate)
+-	go c.derpActiveFunc()
++	go func() {
++		select {
++		case <-ctx.Done():
++			return
++		case <-startGate:
++			c.derpActiveFunc()
++		}
++	}()
+ 
+ 	return ad.writeCh
+ }
+@@ -527,7 +535,9 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
+ 	var lastPacketSrc key.NodePublic
+ 
+ 	for {
++		c.logf("[PS5 derp] RecvDetail waiting region=%d", regionID)
+ 		msg, connGen, err := dc.RecvDetail()
++		c.logf("[PS5 derp] RecvDetail returned region=%d type=%T connGen=%d err=%v", regionID, msg, connGen, err)
+ 		if err != nil {
+ 			c.health.SetDERPRegionConnectedState(regionID, false)
+ 			// Forget that all these peers have routes.
+@@ -576,11 +586,40 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
+ 			c.health.SetDERPRegionConnectedState(regionID, true)
+ 			c.health.SetDERPRegionHealth(regionID, "") // until declared otherwise
+ 			c.logf("magicsock: derp-%d connected; connGen=%v", regionID, connGen)
++			c.logf("[AUTH194 derp] PS5 restoring receive loop after ServerInfo region=%d connGen=%d", regionID, connGen)
++			go func() {
++				pingCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
++				defer cancel()
++				c.logf("[PS5 derp selfping] starting region=%d", regionID)
++				err := dc.Ping(pingCtx)
++				c.logf("[PS5 derp selfping] returned region=%d err=%v", regionID, err)
++			}()
++			go func() {
++				c.logf("[PS5 derp periodic-ping] goroutine-start region=%d", regionID)
++				for seq := 1; seq <= 60; seq++ {
++					timer := time.NewTimer(5 * time.Second)
++					select {
++					case <-ctx.Done():
++						if !timer.Stop() {
++							<-timer.C
++						}
++						c.logf("[PS5 derp periodic-ping] context done region=%d", regionID)
++						return
++					case <-timer.C:
++					}
++					pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
++					c.logf("[PS5 derp periodic-ping] start region=%d seq=%d", regionID, seq)
++					err := dc.Ping(pingCtx)
++					cancel()
++					c.logf("[PS5 derp periodic-ping] done region=%d seq=%d err=%v", regionID, seq, err)
++				}
++			}()
+ 			continue
+ 		case derp.ReceivedPacket:
+ 			pkt = m
+ 			res.n = len(m.Data)
+ 			res.src = m.Source
++			c.logf("[PS5 derp peer] region=%d src=%s bytes=%d connGen=%d", regionID, m.Source.ShortString(), len(m.Data), connGen)
+ 			if logDerpVerbose() {
+ 				c.logf("magicsock: got derp-%v packet: %q", regionID, m.Data)
+ 			}
+diff --git a/wgengine/magicsock/endpoint.go b/wgengine/magicsock/endpoint.go
+index eda589e..a6c0058 100644
+--- a/wgengine/magicsock/endpoint.go
++++ b/wgengine/magicsock/endpoint.go
+@@ -1919,6 +1919,7 @@ func betterAddr(a, b addrQuality) bool {
+ // already sent to us via UDP, so their stateful firewall should be
+ // open. Now we can Ping back and make it through.
+ func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
++	de.c.logf("[PS5 cmm] recv peer=%s disco=%s endpoints=%v", de.publicKey.ShortString(), de.discoShort(), m.MyNumber)
+ 	if runtime.GOOS == "js" {
+ 		// Nothing to do on js/wasm if we can't send UDP packets anyway.
+ 		return
+diff --git a/wgengine/magicsock/magicsock.go b/wgengine/magicsock/magicsock.go
+index 8fbd070..268ab2c 100644
+--- a/wgengine/magicsock/magicsock.go
++++ b/wgengine/magicsock/magicsock.go
+@@ -1756,7 +1756,9 @@ func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFu
+ 		batch := c.getReceiveBatchForBuffs(buffs)
+ 		defer c.putReceiveBatch(batch)
+ 		for {
++			c.logf("[PS5 udp] ReadBatch waiting slots=%d", len(buffs))
+ 			numMsgs, err := ruc.ReadBatch(batch.msgs[:len(buffs)], 0)
++			c.logf("[PS5 udp] ReadBatch returned numMsgs=%d err=%v", numMsgs, err)
+ 			if err != nil {
+ 				if neterror.PacketWasTruncated(err) {
+ 					continue
+@@ -1766,6 +1768,9 @@ func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFu
+ 
+ 			reportToCaller := false
+ 			for i, msg := range batch.msgs[:numMsgs] {
++				if msg.N > 0 {
++					c.logf("[PS5 udp] packet i=%d bytes=%d from=%v", i, msg.N, msg.Addr)
++				}
+ 				if msg.N == 0 {
+ 					sizes[i] = 0
+ 					continue
+@@ -2636,6 +2641,7 @@ func (c *Conn) enqueueCallMeMaybe(derpAddr netip.AddrPort, de *endpoint) {
+ 	}
+ 
+ 	if !c.lastEndpointsTime.After(time.Now().Add(-endpointsFreshEnoughDuration)) {
++		c.logf("[PS5 cmm] endpoints stale; restun before CallMeMaybe peer=%s derp=%v lastEndpoints=%v", de.publicKey.ShortString(), derpAddr, c.lastEndpoints)
+ 		c.dlogf("[v1] magicsock: want call-me-maybe but endpoints stale; restunning")
+ 
+ 		mak.Set(&c.onEndpointRefreshed, de, func() {
+@@ -2658,6 +2664,7 @@ func (c *Conn) enqueueCallMeMaybe(derpAddr netip.AddrPort, de *endpoint) {
+ 	for _, ep := range c.lastEndpoints {
+ 		eps = append(eps, ep.Addr)
+ 	}
++	c.logf("[PS5 cmm] send peer=%s derp=%v endpoints=%v", de.publicKey.ShortString(), derpAddr, eps)
+ 	go de.c.sendDiscoMessage(epAddr{ap: derpAddr}, de.publicKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog)
+ 	if debugSendCallMeUnknownPeer() {
+ 		// Send a callMeMaybe packet to a non-existent peer
+@@ -3460,6 +3467,9 @@ func (c *Conn) onPortMapChanged(portmappertype.Mapping) { c.ReSTUN("portmap-chan
+ // If Conn.staticEndpoints have been updated, calling ReSTUN will also result in
+ // the new endpoints being advertised.
+ func (c *Conn) ReSTUN(why string) {
++	if runtime.GOOS == "freebsd" {
++		c.logf("[AUTH193 netcheck] PS5 restoring ReSTUN reason=%q", why)
++	}
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 	if c.closed {
+diff --git a/wgengine/wgcfg/nmcfg/nmcfg.go b/wgengine/wgcfg/nmcfg/nmcfg.go
+index a428273..7b014bb 100644
+--- a/wgengine/wgcfg/nmcfg/nmcfg.go
++++ b/wgengine/wgcfg/nmcfg/nmcfg.go
+@@ -6,7 +6,6 @@
+ 
+ import (
+ 	"bufio"
+-	"cmp"
+ 	"fmt"
+ 	"net/netip"
+ 	"strings"
+@@ -21,7 +20,14 @@
+ )
+ 
+ func nodeDebugName(n tailcfg.NodeView) string {
+-	name, _, _ := strings.Cut(cmp.Or(n.Name(), n.Hostinfo().Hostname()), ".")
++	name := n.Name()
++	if name == "" {
++		hi := n.Hostinfo()
++		if hi.Valid() {
++			name = hi.Hostname()
++		}
++	}
++	name, _, _ = strings.Cut(name, ".")
+ 	return name
+ }
+ 
+@@ -77,6 +83,9 @@ func WGCfg(pk key.NodePrivate, nm *netmap.NetworkMap, logf logger.Logf, flags ne
+ 	var skippedExitNode, skippedSubnetRouter, skippedExpired []tailcfg.NodeView
+ 
+ 	for _, peer := range nm.Peers {
++		logf("[PS5 wgcfg] peer name=%s key=%s discoZero=%v homeDERP=%d endpoints=%d allowed=%v expired=%v",
++			nodeDebugName(peer), peer.Key().ShortString(), peer.DiscoKey().IsZero(), peer.HomeDERP(),
++			peer.Endpoints().Len(), peer.AllowedIPs().AsSlice(), peer.Expired())
+ 		if peer.DiscoKey().IsZero() && peer.HomeDERP() == 0 && !peer.IsWireGuardOnly() {
+ 			// Peer predates both DERP and active discovery, we cannot
+ 			// communicate with it.
+@@ -95,6 +104,7 @@ func WGCfg(pk key.NodePrivate, nm *netmap.NetworkMap, logf logger.Logf, flags ne
+ 			PublicKey: peer.Key(),
+ 			DiscoKey:  peer.DiscoKey(),
+ 		})
++		logf("[PS5 wgcfg] appended peer name=%s key=%s", nodeDebugName(peer), peer.Key().ShortString())
+ 		cpeer := &cfg.Peers[len(cfg.Peers)-1]
+ 
+ 		didExitNodeLog := false
+diff --git a/net/netcheck/captiveportal.go b/net/netcheck/captiveportal.go
+index ad11f19..2de15c4 100644
+--- a/net/netcheck/captiveportal.go
++++ b/net/netcheck/captiveportal.go
+@@ -30,7 +30,9 @@ func startCaptivePortalDetection(ctx context.Context, rs *reportState, dm *tailc
+ 		defer close(ch)
+ 		d := captivedetection.NewDetector(c.logf)
+ 		found := d.Detect(ctx, c.NetMon, dm, preferredDERP)
++		rs.mu.Lock()
+ 		rs.report.CaptivePortal.Set(found)
++		rs.mu.Unlock()
+ 	})
+ 
+ 	stop = func() {
+diff --git a/net/netcheck/netcheck.go b/net/netcheck/netcheck.go
+index c5a3d23..3e7245c 100644
+--- a/net/netcheck/netcheck.go
++++ b/net/netcheck/netcheck.go
+@@ -595,7 +595,6 @@ type reportState struct {
+ 	opts        *GetReportOpts
+ 	incremental bool // doing a lite, follow-up netcheck
+ 	stopProbeCh chan struct{}
+-	waitPortMap sync.WaitGroup
+ 
+ 	mu       syncs.Mutex
+ 	report   *Report                            // to be returned by GetReport
+@@ -722,14 +721,8 @@ func (rs *reportState) setOptBool(b *opt.Bool, v bool) {
+ 	b.Set(v)
+ }
+ 
+-func (rs *reportState) probePortMapServices() {
+-	defer rs.waitPortMap.Done()
+-
+-	rs.setOptBool(&rs.report.UPnP, false)
+-	rs.setOptBool(&rs.report.PMP, false)
+-	rs.setOptBool(&rs.report.PCP, false)
+-
+-	res, err := rs.c.PortMapper.Probe(context.Background())
++func (rs *reportState) probePortMapServices(ctx context.Context) {
++	res, err := rs.c.PortMapper.Probe(ctx)
+ 	if err != nil {
+ 		if !errors.Is(err, portmappertype.ErrGatewayRange) {
+ 			// "skipping portmap; gateway range likely lacks support"
+@@ -898,9 +891,16 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
+ 		v6udp.Close()
+ 	}
+ 
++	var portMapDone chan struct{}
+ 	if !c.SkipExternalNetwork && c.PortMapper != nil {
+-		rs.waitPortMap.Add(1)
+-		go rs.probePortMapServices()
++		rs.setOptBool(&rs.report.UPnP, false)
++		rs.setOptBool(&rs.report.PMP, false)
++		rs.setOptBool(&rs.report.PCP, false)
++		portMapDone = make(chan struct{})
++		go func() {
++			defer close(portMapDone)
++			rs.probePortMapServices(ctx)
++		}()
+ 	}
+ 
+ 	var plan probePlan
+@@ -951,9 +951,13 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
+ 		captivePortalStop()
+ 	}
+ 
+-	if !c.SkipExternalNetwork && c.PortMapper != nil {
+-		rs.waitPortMap.Wait()
+-		c.vlogf("portMap done")
++	if portMapDone != nil {
++		select {
++		case <-portMapDone:
++			c.vlogf("portMap done")
++		case <-ctx.Done():
++			c.logf("netcheck: portmap probe exceeded report deadline; continuing")
++		}
+ 	}
+ 	rs.stopTimers()
+ 
+@@ -1017,7 +1021,11 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
+ 	}
+ 
+ 	// Wait for captive portal check before finishing the report.
+-	<-captivePortalDone
++	select {
++	case <-captivePortalDone:
++	case <-ctx.Done():
++		c.logf("netcheck: captive portal check exceeded report deadline; continuing")
++	}
+ 
+ 	return c.finishAndStoreReport(rs, dm), nil
+ }
+diff --git a/net/netcheck/netcheck_test.go b/net/netcheck/netcheck_test.go
+index 6830e7f..888595a 100644
+--- a/net/netcheck/netcheck_test.go
++++ b/net/netcheck/netcheck_test.go
+@@ -19,7 +19,9 @@ import (
+ 	"time"
+ 
+ 	"tailscale.com/derp"
++	"tailscale.com/feature/buildfeatures"
+ 	"tailscale.com/net/netmon"
++	"tailscale.com/net/portmapper/portmappertype"
+ 	"tailscale.com/net/stun/stuntest"
+ 	"tailscale.com/tailcfg"
+ 	"tailscale.com/tstest/nettest"
+@@ -1049,3 +1051,91 @@ func TestNoUDPNilGetReportOpts(t *testing.T) {
+ 		t.Fatal("unexpected working UDP")
+ 	}
+ }
++
++type stalledPortMapper struct {
++	started chan struct{}
++	release chan struct{}
++}
++
++func (p *stalledPortMapper) Probe(context.Context) (portmappertype.ProbeResult, error) {
++	close(p.started)
++	<-p.release // Simulate a PS5 network operation that ignores cancellation.
++	return portmappertype.ProbeResult{UPnP: true}, nil
++}
++func (*stalledPortMapper) HaveMapping() bool                                          { return false }
++func (*stalledPortMapper) SetGatewayLookupFunc(func() (netip.Addr, netip.Addr, bool)) {}
++func (*stalledPortMapper) NoteNetworkDown()                                           {}
++func (*stalledPortMapper) GetCachedMappingOrStartCreatingOne() (netip.AddrPort, bool) {
++	return netip.AddrPort{}, false
++}
++func (*stalledPortMapper) SetLocalPort(uint16) {}
++func (*stalledPortMapper) Close() error        { return nil }
++
++func TestPS5NetcheckPortMapDeadline(t *testing.T) {
++	stunAddr, cleanup := stuntest.Serve(t)
++	defer cleanup()
++	baseCtx, stop := context.WithCancel(context.Background())
++	defer stop()
++	c := newTestClient(t)
++	pm := &stalledPortMapper{started: make(chan struct{}), release: make(chan struct{})}
++	defer close(pm.release)
++	c.PortMapper = pm
++	if err := c.Standalone(baseCtx, "127.0.0.1:0"); err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithTimeout(baseCtx, 150*time.Millisecond)
++	defer cancel()
++	done := make(chan error, 1)
++	go func() {
++		_, err := c.GetReport(ctx, stuntest.DERPMapOf(stunAddr.String()), nil)
++		done <- err
++	}()
++	select {
++	case <-pm.started:
++	case <-time.After(2 * time.Second):
++		t.Fatal("portmap probe did not start")
++	}
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatalf("GetReport: %v", err)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("GetReport waited for a stalled portmap probe after its deadline")
++	}
++}
++
++func TestPS5NetcheckCaptivePortalDeadline(t *testing.T) {
++	if !buildfeatures.HasCaptivePortal {
++		t.Skip("captive portal feature not linked")
++	}
++	stunAddr, cleanup := stuntest.Serve(t)
++	defer cleanup()
++	baseCtx, stop := context.WithCancel(context.Background())
++	defer stop()
++	c := newTestClient(t)
++	if err := c.Standalone(baseCtx, "127.0.0.1:0"); err != nil {
++		t.Fatal(err)
++	}
++	portalDone := make(chan struct{})
++	defer close(portalDone)
++	restore := hookStartCaptivePortalDetection.SetForTest(func(context.Context, *reportState, *tailcfg.DERPMap, int) (<-chan struct{}, func()) {
++		return portalDone, func() {}
++	})
++	defer restore()
++	ctx, cancel := context.WithTimeout(baseCtx, 150*time.Millisecond)
++	defer cancel()
++	done := make(chan error, 1)
++	go func() {
++		_, err := c.GetReport(ctx, stuntest.DERPMapOf(stunAddr.String()), nil)
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatalf("GetReport: %v", err)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("GetReport waited for a stalled captive portal check after its deadline")
++	}
++}
+diff --git a/net/portmapper/portmapper.go b/net/portmapper/portmapper.go
+index 16a981d..0f1bc1d 100644
+--- a/net/portmapper/portmapper.go
++++ b/net/portmapper/portmapper.go
+@@ -888,7 +888,7 @@ func (c *Client) Probe(ctx context.Context) (res portmappertype.ProbeResult, err
+ 		}
+ 	}()
+ 
+-	uc, err := c.listenPacket(context.Background(), "udp4", ":0")
++	uc, err := c.listenPacket(ctx, "udp4", ":0")
+ 	if err != nil {
+ 		c.logf("ProbePCP: %v", err)
+ 		return res, err
+diff --git a/derp/derphttp/derphttp_client.go b/derp/derphttp/derphttp_client.go
+--- a/derp/derphttp/derphttp_client.go
++++ b/derp/derphttp/derphttp_client.go
+@@ -56,7 +56,7 @@
+ // has been called).
+ type ps5TraceConn struct {
+ 	net.Conn
+-	logf logger.Logf
++	logf  logger.Logf
+ 	label string
+ }
+ 
+@@ -64,6 +64,13 @@
+ 	c.logf("[PS5 derp net] %s Read waiting want=%d", c.label, len(p))
+ 	n, err := c.Conn.Read(p)
+ 	c.logf("[PS5 derp net] %s Read returned n=%d err=%v", c.label, n, err)
++	if n < 0 {
++		if err == nil {
++			err = io.ErrNoProgress
++		}
++		c.logf("[PS5 derp net] %s normalized negative Read n=%d err=%v", c.label, n, err)
++		return 0, err
++	}
+ 	return n, err
+ }
+ 
+diff --git a/derp/derphttp/export_test.go b/derp/derphttp/export_test.go
+--- a/derp/derphttp/export_test.go
++++ b/derp/derphttp/export_test.go
+@@ -2,6 +2,12 @@
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+ package derphttp
++
++import "net"
++
++func PS5TraceConnReadForTest(conn net.Conn) (int, error) {
++	return (&ps5TraceConn{Conn: conn, logf: func(string, ...any) {}, label: "tcp"}).Read(make([]byte, 8))
++}
+ 
+ func SetTestHookWatchLookConnectResult(f func(connectError error, wasSelfConnect bool) (keepRunning bool)) {
+ 	testHookWatchLookConnectResult = f
+diff --git a/derp/derphttp/derphttp_test.go b/derp/derphttp/derphttp_test.go
+--- a/derp/derphttp/derphttp_test.go
++++ b/derp/derphttp/derphttp_test.go
+@@ -11,6 +11,7 @@
+ 	"errors"
+ 	"flag"
+ 	"fmt"
++	"io"
+ 	"maps"
+ 	"net"
+ 	"net/http"
+@@ -629,3 +630,28 @@
+ 		t.Fatalf("rc.Connect: %v", err)
+ 	}
+ }
++
++type ps5InvalidReadConn struct {
++	net.Conn
++	err error
++}
++
++func (c ps5InvalidReadConn) Read([]byte) (int, error) { return -1, c.err }
++
++func TestPS5TraceConnNormalizesNegativeRead(t *testing.T) {
++	for _, tc := range []struct {
++		name string
++		err  error
++		want error
++	}{
++		{name: "socket error", err: io.ErrUnexpectedEOF, want: io.ErrUnexpectedEOF},
++		{name: "missing error", want: io.ErrNoProgress},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			n, err := derphttp.PS5TraceConnReadForTest(ps5InvalidReadConn{err: tc.err})
++			if n != 0 || !errors.Is(err, tc.want) {
++				t.Fatalf("Read = (%d, %v), want (0, %v)", n, err, tc.want)
++			}
++		})
++	}
++}

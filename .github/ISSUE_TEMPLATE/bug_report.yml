@@ -1,0 +1,71 @@
+name: Bug report
+description: Report a PS5Tailscale Beta problem
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: input
+    id: firmware
+    attributes:
+      label: PS5 firmware
+      placeholder: "Example: 11.60"
+    validations:
+      required: true
+  - type: input
+    id: loader
+    attributes:
+      label: Jailbreak / ELF loader
+      placeholder: "Name and version if known"
+    validations:
+      required: true
+  - type: dropdown
+    id: network
+    attributes:
+      label: PS5 network connection
+      options: [Wired Ethernet, Wi-Fi, Other]
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: Client device and OS
+      placeholder: "Example: Steam Deck / SteamOS, Android phone, Windows 11"
+    validations:
+      required: true
+  - type: input
+    id: remoteplay
+    attributes:
+      label: Remote Play client
+      placeholder: "Chiaki-ng or PXPlay / PSPlay, including version if known"
+  - type: dropdown
+    id: power_state
+    attributes:
+      label: PS5 state when the problem happened
+      options: [Awake, Entering Rest Mode, In Rest Mode, Waking from Rest Mode, After wake]
+    validations:
+      required: true
+  - type: input
+    id: rest_duration
+    attributes:
+      label: Approximate Rest Mode duration
+      placeholder: "Example: 25 minutes, 6 hours, not applicable"
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Include what you expected, what happened instead, and the exact steps that led to it.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Attach the generated diagnostics ZIP if available. Review it first and never include auth keys or Tailscale state files.
+  - type: checkboxes
+    id: secrets
+    attributes:
+      label: Privacy check
+      options:
+        - label: I checked my attachments and did not include a Tailscale auth key, private key, or `/data/tailscale` state file.
+          required: true
+        - label: I reviewed diagnostic attachments for LAN/Tailscale addresses, peer/device names, and other network metadata I do not want to share publicly.
+          required: true

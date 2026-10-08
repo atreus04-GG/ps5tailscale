@@ -1,0 +1,1220 @@
+diff --git a/src/crypto/internal/sysrand/rand_getrandom.go b/src/crypto/internal/sysrand/rand_getrandom.go
+index 11e9683..afc031a 100644
+--- a/src/crypto/internal/sysrand/rand_getrandom.go
++++ b/src/crypto/internal/sysrand/rand_getrandom.go
+@@ -15,6 +15,13 @@ import (
+ )
+ 
+ func read(b []byte) error {
++	// PS5/Prospero is built as freebsd/amd64 but does not expose the modern
++	// FreeBSD getrandom syscall expected by Go 1.25.5. /dev/urandom has been
++	// verified readable on-console, so bypass getrandom for this PS5 toolchain.
++	if runtime.GOOS == "freebsd" {
++		return urandomRead(b)
++	}
++
+ 	// Linux, DragonFly, and illumos don't have a limit on the buffer size.
+ 	// FreeBSD has a limit of IOSIZE_MAX, which seems to be either INT_MAX or
+ 	// SSIZE_MAX. 2^31-1 is a safe and high enough value to use for all of them.
+diff --git a/src/crypto/x509/root_bsd.go b/src/crypto/x509/root_bsd.go
+index a76aef8..31ed33d 100644
+--- a/src/crypto/x509/root_bsd.go
++++ b/src/crypto/x509/root_bsd.go
+@@ -8,6 +8,7 @@ package x509
+ 
+ // Possible certificate files; stop after finding one.
+ var certFiles = []string{
++	"/data/tailscale/ca-certificates.crt",    // PS5/Prospero device-local CA bundle
+ 	"/usr/local/etc/ssl/cert.pem",            // FreeBSD
+ 	"/etc/ssl/cert.pem",                      // OpenBSD
+ 	"/usr/local/share/certs/ca-root-nss.crt", // DragonFly
+diff --git a/src/internal/poll/fd_poll_runtime.go b/src/internal/poll/fd_poll_runtime.go
+index 2aef112..905284c 100644
+--- a/src/internal/poll/fd_poll_runtime.go
++++ b/src/internal/poll/fd_poll_runtime.go
+@@ -159,7 +159,9 @@ func setDeadlineImpl(fd *FD, t time.Time, mode int) error {
+ 	if fd.pd.runtimeCtx == 0 {
+ 		return ErrNoDeadline
+ 	}
++	ps5PollTrace("set-deadline-before", int(fd.Sysfd), d, nil)
+ 	runtime_pollSetDeadline(fd.pd.runtimeCtx, d, mode)
++	ps5PollTrace("set-deadline-after", int(fd.Sysfd), d, nil)
+ 	return nil
+ }
+ 
+diff --git a/src/internal/poll/fd_unix.go b/src/internal/poll/fd_unix.go
+index 31e6e21..2c00c5a 100644
+--- a/src/internal/poll/fd_unix.go
++++ b/src/internal/poll/fd_unix.go
+@@ -151,9 +151,12 @@ func (fd *FD) Read(p []byte) (int, error) {
+ 		// TODO(bradfitz): make it wait for readability? (Issue 15735)
+ 		return 0, nil
+ 	}
++	ps5PollTrace("prepare-read-before", fd.Sysfd, int64(len(p)), nil)
+ 	if err := fd.pd.prepareRead(fd.isFile); err != nil {
++		ps5PollTrace("prepare-read-after", fd.Sysfd, int64(len(p)), err)
+ 		return 0, err
+ 	}
++	ps5PollTrace("prepare-read-after", fd.Sysfd, int64(len(p)), nil)
+ 	if fd.IsStream && len(p) > maxRW {
+ 		p = p[:maxRW]
+ 	}
+@@ -162,9 +165,13 @@ func (fd *FD) Read(p []byte) (int, error) {
+ 		if err != nil {
+ 			n = 0
+ 			if err == syscall.EAGAIN && fd.pd.pollable() {
++				ps5PollTrace("read-eagain", fd.Sysfd, int64(len(p)), err)
++				ps5PollTrace("wait-read-before", fd.Sysfd, int64(len(p)), nil)
+ 				if err = fd.pd.waitRead(fd.isFile); err == nil {
++					ps5PollTrace("wait-read-after", fd.Sysfd, int64(len(p)), nil)
+ 					continue
+ 				}
++				ps5PollTrace("wait-read-after", fd.Sysfd, int64(len(p)), err)
+ 			}
+ 		}
+ 		err = fd.eofError(n, err)
+diff --git a/src/internal/poll/ps5_trace.go b/src/internal/poll/ps5_trace.go
+new file mode 100644
+index 0000000..e3ad1f8
+--- /dev/null
++++ b/src/internal/poll/ps5_trace.go
+@@ -0,0 +1,47 @@
++//go:build unix
++
++package poll
++
++import (
++	"strconv"
++	"sync/atomic"
++	"syscall"
++)
++
++var ps5PollTraceFD atomic.Int64
++
++func init() {
++	ps5PollTraceFD.Store(-1)
++}
++
++func runtime_setPS5PollTraceFD(fd int)
++
++func SetPS5PollTraceFDForTest(fd int) {
++	ps5PollTraceFD.Store(int64(fd))
++	runtime_setPS5PollTraceFD(fd)
++}
++
++func PS5TraceForTest(stage string, fd int, detail int64) {
++	ps5PollTrace(stage, fd, detail, nil)
++}
++
++func ps5PollTrace(stage string, fd int, detail int64, err error) {
++	outfd := int(ps5PollTraceFD.Load())
++	if outfd < 0 {
++		return
++	}
++	b := make([]byte, 0, 160)
++	b = append(b, "[AUTH151 poll-direct] stage="...)
++	b = append(b, stage...)
++	b = append(b, " fd="...)
++	b = strconv.AppendInt(b, int64(fd), 10)
++	b = append(b, " detail="...)
++	b = strconv.AppendInt(b, detail, 10)
++	if err != nil {
++		b = append(b, " err=1"...)
++	} else {
++		b = append(b, " err=0"...)
++	}
++	b = append(b, '\n')
++	_, _ = syscall.Write(outfd, b)
++}
+diff --git a/src/internal/poll/ps5_trace_windows.go b/src/internal/poll/ps5_trace_windows.go
+new file mode 100644
+index 0000000..64eab2c
+--- /dev/null
++++ b/src/internal/poll/ps5_trace_windows.go
+@@ -0,0 +1,9 @@
++//go:build windows
++
++package poll
++
++func SetPS5PollTraceFDForTest(fd int) {}
++
++func PS5TraceForTest(stage string, fd int, detail int64) {}
++
++func ps5PollTrace(stage string, fd int, detail int64, err error) {}
+diff --git a/src/internal/poll/sock_cloexec.go b/src/internal/poll/sock_cloexec.go
+index 466ee31..3262b75 100644
+--- a/src/internal/poll/sock_cloexec.go
++++ b/src/internal/poll/sock_cloexec.go
+@@ -15,8 +15,26 @@ import "syscall"
+ // descriptor as nonblocking and close-on-exec.
+ func accept(s int) (int, syscall.Sockaddr, string, error) {
+ 	ns, sa, err := Accept4Func(s, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
+-	if err != nil {
++	if err == nil {
++		return ns, sa, "", nil
++	}
++	// PS5/Prospero exposes the older FreeBSD accept syscall, but its
++	// accept4 syscall returns ESRCH. Fall back to accept + fcntl-style
++	// descriptor setup when accept4 is unavailable on the target kernel.
++	if err != syscall.ENOSYS && err != syscall.ESRCH {
+ 		return -1, nil, "accept4", err
+ 	}
++
++	ns, sa, err = AcceptFunc(s)
++	if err == nil {
++		syscall.CloseOnExec(ns)
++	}
++	if err != nil {
++		return -1, nil, "accept", err
++	}
++	if err = syscall.SetNonblock(ns, true); err != nil {
++		CloseFunc(ns)
++		return -1, nil, "setnonblock", err
++	}
+ 	return ns, sa, "", nil
+ }
+diff --git a/src/net/dial.go b/src/net/dial.go
+index 6264984..8a0bf57 100644
+--- a/src/net/dial.go
++++ b/src/net/dial.go
+@@ -715,6 +715,9 @@ func (sd *sysDialer) dialSingle(ctx context.Context, ra Addr) (c Conn, err error
+ 	switch ra := ra.(type) {
+ 	case *TCPAddr:
+ 		la, _ := la.(*TCPAddr)
++		if c0, handled, rawErr := ps5RawTCPDial(ctx, sd.network, la, ra); handled {
++			return c0, rawErr
++		}
+ 		if sd.MultipathTCP() {
+ 			c, err = sd.dialMPTCP(ctx, la, ra)
+ 		} else {
+diff --git a/src/net/fd_posix.go b/src/net/fd_posix.go
+index 023cd53..c378f1f 100644
+--- a/src/net/fd_posix.go
++++ b/src/net/fd_posix.go
+@@ -148,13 +148,22 @@ func (fd *netFD) writeMsgInet6(p []byte, oob []byte, sa *syscall.SockaddrInet6)
+ }
+ 
+ func (fd *netFD) SetDeadline(t time.Time) error {
++	if handled, err := ps5SetNativeDeadline(uintptr(fd.pfd.Sysfd), fd.sotype, t, true, true); handled {
++		return err
++	}
+ 	return fd.pfd.SetDeadline(t)
+ }
+ 
+ func (fd *netFD) SetReadDeadline(t time.Time) error {
++	if handled, err := ps5SetNativeDeadline(uintptr(fd.pfd.Sysfd), fd.sotype, t, true, false); handled {
++		return err
++	}
+ 	return fd.pfd.SetReadDeadline(t)
+ }
+ 
+ func (fd *netFD) SetWriteDeadline(t time.Time) error {
++	if handled, err := ps5SetNativeDeadline(uintptr(fd.pfd.Sysfd), fd.sotype, t, false, true); handled {
++		return err
++	}
+ 	return fd.pfd.SetWriteDeadline(t)
+ }
+diff --git a/src/net/fd_unix.go b/src/net/fd_unix.go
+index 8d3858d..35b336f 100644
+--- a/src/net/fd_unix.go
++++ b/src/net/fd_unix.go
+@@ -34,10 +34,18 @@ func newFD(sysfd, family, sotype int, net string) (*netFD, error) {
+ 		sotype: sotype,
+ 		net:    net,
+ 	}
++	poll.PS5TraceForTest("AUTH155-netfd-"+net, sysfd, int64(uint64(uint32(family))<<32|uint64(uint32(sotype))))
+ 	return ret, nil
+ }
+ 
+ func (fd *netFD) init() error {
++	if runtime.GOOS == "freebsd" && fd.sotype == syscall.SOCK_DGRAM {
++		poll.PS5TraceForTest("AUTH158-udp-blocking-init", fd.pfd.Sysfd, int64(fd.family))
++		if err := syscall.SetNonblock(fd.pfd.Sysfd, false); err != nil {
++			return err
++		}
++		return fd.pfd.Init(fd.net, false)
++	}
+ 	return fd.pfd.Init(fd.net, true)
+ }
+ 
+@@ -45,7 +53,27 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa sysc
+ 	// Do not need to call fd.writeLock here,
+ 	// because fd is not yet accessible to user,
+ 	// so no concurrent operations are possible.
+-	switch err := connectFunc(fd.pfd.Sysfd, ra); err {
++	if runtime.GOOS == "freebsd" && fd.sotype == syscall.SOCK_DGRAM {
++		poll.PS5TraceForTest("AUTH158-udp-blocking-connect", fd.pfd.Sysfd, int64(fd.family))
++		if err := syscall.SetNonblock(fd.pfd.Sysfd, false); err != nil {
++			return nil, err
++		}
++		if err := connectFunc(fd.pfd.Sysfd, ra); err != nil {
++			return nil, os.NewSyscallError("connect", err)
++		}
++		if err := fd.pfd.Init(fd.net, false); err != nil {
++			return nil, err
++		}
++		return nil, nil
++	}
++	if ps5ConnectTraceForTest != nil {
++		ps5ConnectTraceForTest("before-connect", fd.pfd.Sysfd, nil)
++	}
++	err := connectFunc(fd.pfd.Sysfd, ra)
++	if ps5ConnectTraceForTest != nil {
++		ps5ConnectTraceForTest("after-connect", fd.pfd.Sysfd, err)
++	}
++	switch err {
+ 	case syscall.EINPROGRESS, syscall.EALREADY, syscall.EINTR:
+ 	case nil, syscall.EISCONN:
+ 		select {
+@@ -71,11 +99,26 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa sysc
+ 	default:
+ 		return nil, os.NewSyscallError("connect", err)
+ 	}
++	if ps5ConnectTraceForTest != nil {
++		ps5ConnectTraceForTest("before-poller-init", fd.pfd.Sysfd, nil)
++	}
+ 	if err := fd.pfd.Init(fd.net, true); err != nil {
++		if ps5ConnectTraceForTest != nil {
++			ps5ConnectTraceForTest("poller-init-error", fd.pfd.Sysfd, err)
++		}
+ 		return nil, err
+ 	}
++	if ps5ConnectTraceForTest != nil {
++		ps5ConnectTraceForTest("after-poller-init", fd.pfd.Sysfd, nil)
++	}
+ 	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
++		if ps5ConnectTraceForTest != nil {
++			ps5ConnectTraceForTest("before-set-write-deadline", fd.pfd.Sysfd, nil)
++		}
+ 		fd.pfd.SetWriteDeadline(deadline)
++		if ps5ConnectTraceForTest != nil {
++			ps5ConnectTraceForTest("after-set-write-deadline", fd.pfd.Sysfd, nil)
++		}
+ 		defer fd.pfd.SetWriteDeadline(noDeadline)
+ 	}
+ 
+@@ -106,6 +149,9 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa sysc
+ 		go func() {
+ 			select {
+ 			case <-ctxDone:
++				if ps5ConnectTraceForTest != nil {
++					ps5ConnectTraceForTest("context-done", fd.pfd.Sysfd, ctx.Err())
++				}
+ 				// Force the runtime's poller to immediately give up
+ 				// waiting for writability, unblocking waitWrite
+ 				// below.
+@@ -127,7 +173,13 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa sysc
+ 		// SO_ERROR socket option to see if the connection
+ 		// succeeded or failed. See issue 7474 for further
+ 		// details.
++		if ps5ConnectTraceForTest != nil {
++			ps5ConnectTraceForTest("before-wait-write", fd.pfd.Sysfd, nil)
++		}
+ 		if err := fd.pfd.WaitWrite(); err != nil {
++			if ps5ConnectTraceForTest != nil {
++				ps5ConnectTraceForTest("wait-write-error", fd.pfd.Sysfd, err)
++			}
+ 			select {
+ 			case <-ctxDone:
+ 				return nil, mapErr(ctx.Err())
+@@ -135,7 +187,14 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa sysc
+ 			}
+ 			return nil, err
+ 		}
++		if ps5ConnectTraceForTest != nil {
++			ps5ConnectTraceForTest("after-wait-write", fd.pfd.Sysfd, nil)
++			ps5ConnectTraceForTest("before-so-error", fd.pfd.Sysfd, nil)
++		}
+ 		nerr, err := getsockoptIntFunc(fd.pfd.Sysfd, syscall.SOL_SOCKET, syscall.SO_ERROR)
++		if ps5ConnectTraceForTest != nil {
++			ps5ConnectTraceForTest("after-so-error", fd.pfd.Sysfd, err)
++		}
+ 		if err != nil {
+ 			return nil, os.NewSyscallError("getsockopt", err)
+ 		}
+diff --git a/src/net/ps5_blocking_tcp_freebsd.go b/src/net/ps5_blocking_tcp_freebsd.go
+new file mode 100644
+index 0000000..2b03bfb
+--- /dev/null
++++ b/src/net/ps5_blocking_tcp_freebsd.go
+@@ -0,0 +1,160 @@
++//go:build freebsd
++
++package net
++
++import (
++	"context"
++	"internal/poll"
++	"sync"
++	"syscall"
++	"time"
++)
++
++type ps5BlockingTCPConn struct {
++	fd    int
++	laddr Addr
++	raddr Addr
++	once  sync.Once
++}
++
++func ps5RawTCPDial(ctx context.Context, network string, la, ra *TCPAddr) (Conn, bool, error) {
++	if ra == nil {
++		return nil, false, nil
++	}
++	family := syscall.AF_INET6
++	var rsa syscall.Sockaddr
++	if ip4 := ra.IP.To4(); ip4 != nil {
++		family = syscall.AF_INET
++		sa := &syscall.SockaddrInet4{Port: ra.Port}
++		copy(sa.Addr[:], ip4)
++		rsa = sa
++	} else {
++		ip16 := ra.IP.To16()
++		if ip16 == nil || ra.Zone != "" {
++			return nil, true, &OpError{Op: "dial", Net: network, Source: la, Addr: ra, Err: syscall.EAFNOSUPPORT}
++		}
++		sa := &syscall.SockaddrInet6{Port: ra.Port}
++		copy(sa.Addr[:], ip16)
++		rsa = sa
++	}
++
++	select {
++	case <-ctx.Done():
++		return nil, true, &OpError{Op: "dial", Net: network, Source: la, Addr: ra, Err: mapErr(ctx.Err())}
++	default:
++	}
++
++	fd, err := syscall.Socket(family, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
++	if err != nil {
++		return nil, true, &OpError{Op: "dial", Net: network, Source: la, Addr: ra, Err: err}
++	}
++	syscall.CloseOnExec(fd)
++	poll.PS5TraceForTest("AUTH157-raw-tcp-socket", fd, int64(uint64(uint32(family))<<32|uint64(uint32(syscall.SOCK_STREAM))))
++
++	if la != nil {
++		var lsa syscall.Sockaddr
++		if family == syscall.AF_INET {
++			ip4 := la.IP.To4()
++			if ip4 == nil {
++				syscall.Close(fd)
++				return nil, true, &OpError{Op: "dial", Net: network, Source: la, Addr: ra, Err: syscall.EAFNOSUPPORT}
++			}
++			sa := &syscall.SockaddrInet4{Port: la.Port}
++			copy(sa.Addr[:], ip4)
++			lsa = sa
++		} else {
++			ip16 := la.IP.To16()
++			if ip16 == nil || la.Zone != "" {
++				syscall.Close(fd)
++				return nil, true, &OpError{Op: "dial", Net: network, Source: la, Addr: ra, Err: syscall.EAFNOSUPPORT}
++			}
++			sa := &syscall.SockaddrInet6{Port: la.Port}
++			copy(sa.Addr[:], ip16)
++			lsa = sa
++		}
++		if err := syscall.Bind(fd, lsa); err != nil {
++			syscall.Close(fd)
++			return nil, true, &OpError{Op: "dial", Net: network, Source: la, Addr: ra, Err: err}
++		}
++	}
++
++	if deadline, ok := ctx.Deadline(); ok {
++		tv := ps5BlockingTimeval(deadline)
++		_ = syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_SNDTIMEO, &tv)
++	}
++	poll.PS5TraceForTest("AUTH157-raw-tcp-connect-before", fd, int64(family))
++	if err := syscall.Connect(fd, rsa); err != nil {
++		poll.PS5TraceForTest("AUTH157-raw-tcp-connect-error", fd, 1)
++		syscall.Close(fd)
++		return nil, true, &OpError{Op: "dial", Net: network, Source: la, Addr: ra, Err: err}
++	}
++	poll.PS5TraceForTest("AUTH157-raw-tcp-connect-after", fd, int64(family))
++	_ = syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_SNDTIMEO, &syscall.Timeval{})
++
++	laddr := Addr(&TCPAddr{})
++	if sa, err := syscall.Getsockname(fd); err == nil {
++		switch a := sa.(type) {
++		case *syscall.SockaddrInet4:
++			laddr = &TCPAddr{IP: IPv4(a.Addr[0], a.Addr[1], a.Addr[2], a.Addr[3]), Port: a.Port}
++		case *syscall.SockaddrInet6:
++			ip := make(IP, IPv6len)
++			copy(ip, a.Addr[:])
++			laddr = &TCPAddr{IP: ip, Port: a.Port}
++		}
++	}
++	return &ps5BlockingTCPConn{fd: fd, laddr: laddr, raddr: ra}, true, nil
++}
++
++func ps5BlockingTimeval(t time.Time) syscall.Timeval {
++	if t.IsZero() {
++		return syscall.Timeval{}
++	}
++	d := time.Until(t)
++	if d <= 0 {
++		d = time.Microsecond
++	}
++	return syscall.NsecToTimeval(d.Nanoseconds())
++}
++
++func ps5SetNativeDeadline(fd uintptr, sotype int, t time.Time, read, write bool) (bool, error) {
++	if sotype != syscall.SOCK_DGRAM {
++		return false, nil
++	}
++	sysfd := int(fd)
++	tv := ps5BlockingTimeval(t)
++	if read {
++		if err := syscall.SetsockoptTimeval(sysfd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
++			return true, err
++		}
++	}
++	if write {
++		if err := syscall.SetsockoptTimeval(sysfd, syscall.SOL_SOCKET, syscall.SO_SNDTIMEO, &tv); err != nil {
++			return true, err
++		}
++	}
++	return true, nil
++}
++
++func (c *ps5BlockingTCPConn) Read(p []byte) (int, error)  { return syscall.Read(c.fd, p) }
++func (c *ps5BlockingTCPConn) Write(p []byte) (int, error) { return syscall.Write(c.fd, p) }
++func (c *ps5BlockingTCPConn) Close() error {
++	var err error
++	c.once.Do(func() { err = syscall.Close(c.fd) })
++	return err
++}
++func (c *ps5BlockingTCPConn) LocalAddr() Addr  { return c.laddr }
++func (c *ps5BlockingTCPConn) RemoteAddr() Addr { return c.raddr }
++func (c *ps5BlockingTCPConn) SetDeadline(t time.Time) error {
++	if err := c.SetReadDeadline(t); err != nil {
++		return err
++	}
++	return c.SetWriteDeadline(t)
++}
++func (c *ps5BlockingTCPConn) SetReadDeadline(t time.Time) error {
++	tv := ps5BlockingTimeval(t)
++	return syscall.SetsockoptTimeval(c.fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
++}
++func (c *ps5BlockingTCPConn) SetWriteDeadline(t time.Time) error {
++	tv := ps5BlockingTimeval(t)
++	return syscall.SetsockoptTimeval(c.fd, syscall.SOL_SOCKET, syscall.SO_SNDTIMEO, &tv)
++}
+diff --git a/src/net/ps5_blocking_tcp_stub.go b/src/net/ps5_blocking_tcp_stub.go
+new file mode 100644
+index 0000000..35f18bc
+--- /dev/null
++++ b/src/net/ps5_blocking_tcp_stub.go
+@@ -0,0 +1,16 @@
++//go:build !freebsd
++
++package net
++
++import (
++	"context"
++	"time"
++)
++
++func ps5RawTCPDial(ctx context.Context, network string, la, ra *TCPAddr) (Conn, bool, error) {
++	return nil, false, nil
++}
++
++func ps5SetNativeDeadline(fd uintptr, sotype int, t time.Time, read, write bool) (bool, error) {
++	return false, nil
++}
+diff --git a/src/net/ps5_connect_trace.go b/src/net/ps5_connect_trace.go
+new file mode 100644
+index 0000000..7cb2b2e
+--- /dev/null
++++ b/src/net/ps5_connect_trace.go
+@@ -0,0 +1,9 @@
++package net
++
++var ps5ConnectTraceForTest func(stage string, fd int, err error)
++
++// SetPS5ConnectTraceForTest installs a diagnostic callback around the Unix
++// nonblocking connect path. It is only used by the PS5 compatibility probe.
++func SetPS5ConnectTraceForTest(f func(stage string, fd int, err error)) {
++	ps5ConnectTraceForTest = f
++}
+diff --git a/src/net/ps5_poll_trace.go b/src/net/ps5_poll_trace.go
+new file mode 100644
+index 0000000..50cd968
+--- /dev/null
++++ b/src/net/ps5_poll_trace.go
+@@ -0,0 +1,10 @@
++package net
++
++import "internal/poll"
++
++// SetPS5PollTraceFDForTest configures a raw connected descriptor used only by
++// AUTH151 internal/poll tracing. The trace path writes with syscall.Write and
++// does not use net.Conn or the Go runtime poller.
++func SetPS5PollTraceFDForTest(fd int) {
++	poll.SetPS5PollTraceFDForTest(fd)
++}
+diff --git a/src/runtime/defs_freebsd_amd64.go b/src/runtime/defs_freebsd_amd64.go
+index 8f0b08d..aedf8ea 100644
+--- a/src/runtime/defs_freebsd_amd64.go
++++ b/src/runtime/defs_freebsd_amd64.go
+@@ -251,7 +251,6 @@ type keventt struct {
+ 	fflags uint32
+ 	data   int64
+ 	udata  *byte
+-	ext    [4]uint64
+ }
+ 
+ type bintime struct {
+diff --git a/src/runtime/netpoll.go b/src/runtime/netpoll.go
+index fab921e..881695c 100644
+--- a/src/runtime/netpoll.go
++++ b/src/runtime/netpoll.go
+@@ -340,6 +340,7 @@ func poll_runtime_pollReset(pd *pollDesc, mode int) int {
+ //
+ //go:linkname poll_runtime_pollWait internal/poll.runtime_pollWait
+ func poll_runtime_pollWait(pd *pollDesc, mode int) int {
++	ps5RuntimeTrace("POLLWAIT-ENTER", int64(pd.fd), int64(mode))
+ 	errcode := netpollcheckerr(pd, int32(mode))
+ 	if errcode != pollNoError {
+ 		return errcode
+@@ -357,6 +358,7 @@ func poll_runtime_pollWait(pd *pollDesc, mode int) int {
+ 		// but before we had a chance to run, timeout has been reset.
+ 		// Pretend it has not happened and retry.
+ 	}
++	ps5RuntimeTrace("POLLWAIT-RETURN", int64(pd.fd), int64(mode))
+ 	return pollNoError
+ }
+ 
+@@ -572,7 +574,9 @@ func netpollblock(pd *pollDesc, mode int32, waitio bool) bool {
+ 	// this is necessary because runtime_pollUnblock/runtime_pollSetDeadline/deadlineimpl
+ 	// do the opposite: store to closing/rd/wd, publishInfo, load of rg/wg
+ 	if waitio || netpollcheckerr(pd, mode) == pollNoError {
++		ps5RuntimeTrace("BLOCK-PARK", int64(pd.fd), int64(mode))
+ 		gopark(netpollblockcommit, unsafe.Pointer(gpp), waitReasonIOWait, traceBlockNet, 5)
++		ps5RuntimeTrace("BLOCK-RESUME", int64(pd.fd), int64(mode))
+ 	}
+ 	// be careful to not lose concurrent pdReady notification
+ 	old := gpp.Swap(pdNil)
+@@ -620,6 +624,7 @@ func netpollunblock(pd *pollDesc, mode int32, ioready bool, delta *int32) *g {
+ }
+ 
+ func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
++	ps5RuntimeTrace("DEADLINE-FIRE", int64(pd.fd), int64(seq))
+ 	lock(&pd.lock)
+ 	// Seq arg is seq when the timer was set.
+ 	// If it's stale, ignore the timer event.
+@@ -629,6 +634,7 @@ func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
+ 	}
+ 	if seq != currentSeq {
+ 		// The descriptor was reused or timers were reset.
++		ps5RuntimeTrace("DEADLINE-STALE", int64(pd.fd), int64(currentSeq))
+ 		unlock(&pd.lock)
+ 		return
+ 	}
+@@ -653,7 +659,10 @@ func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
+ 	}
+ 	unlock(&pd.lock)
+ 	if rg != nil {
++		ps5RuntimeTrace("DEADLINE-RGREADY", int64(pd.fd), 1)
+ 		netpollgoready(rg, 0)
++	} else if read {
++		ps5RuntimeTrace("DEADLINE-RGNIL", int64(pd.fd), 0)
+ 	}
+ 	if wg != nil {
+ 		netpollgoready(wg, 0)
+diff --git a/src/runtime/netpoll_kqueue.go b/src/runtime/netpoll_kqueue.go
+index db4dddc..bc89bee 100644
+--- a/src/runtime/netpoll_kqueue.go
++++ b/src/runtime/netpoll_kqueue.go
+@@ -15,8 +15,10 @@ import (
+ )
+ 
+ var (
+-	kq             int32         = -1
+-	netpollWakeSig atomic.Uint32 // used to avoid duplicate calls of netpollBreak
++	kq                   int32         = -1
++	netpollWakeSig       atomic.Uint32 // used to avoid duplicate calls of netpollBreak
++	auth160TraceOnce     atomic.Uint32
++	auth162YieldTraceCnt atomic.Uint32
+ )
+ 
+ func netpollinit() {
+@@ -71,12 +73,21 @@ func netpollarm(pd *pollDesc, mode int) {
+ 
+ // netpollBreak interrupts a kevent.
+ func netpollBreak() {
++	if GOOS == "freebsd" {
++		// AUTH159 PS5/Prospero: netpoll never blocks in kevent, so there
++		// is nothing to interrupt. Avoid NOTE_TRIGGER/kevent entirely.
++		ps5RuntimeTrace("AUTH159-BREAK-NOOP", int64(kq), 0)
++		return
++	}
+ 	// Failing to cas indicates there is an in-flight wakeup, so we're done here.
+ 	if !netpollWakeSig.CompareAndSwap(0, 1) {
++		ps5RuntimeTrace("BREAK-SKIP", int64(kq), 0)
+ 		return
+ 	}
+ 
++	ps5RuntimeTrace("BREAK-BEFORE", int64(kq), 0)
+ 	wakeNetpoll(kq)
++	ps5RuntimeTrace("BREAK-AFTER", int64(kq), 0)
+ }
+ 
+ // netpoll checks for ready network connections.
+@@ -91,6 +102,16 @@ func netpoll(delay int64) (gList, int32) {
+ 	if kq == -1 {
+ 		return gList{}, 0
+ 	}
++	if GOOS == "freebsd" {
++		// AUTH167 PS5/Prospero: every blocking primitive tried here has
++		// eventually stopped returning. All PS5 sockets used by the probe
++		// are handled outside runtime netpoll, so return immediately.
++		n := auth162YieldTraceCnt.Add(1)
++		if n == 1 {
++			ps5RuntimeTrace("AUTH167-NETPOLL-IMMEDIATE", int64(n), delay)
++		}
++		return gList{}, 0
++	}
+ 	var tp *timespec
+ 	var ts timespec
+ 	if delay < 0 {
+@@ -107,7 +128,9 @@ func netpoll(delay int64) (gList, int32) {
+ 	}
+ 	var events [64]keventt
+ retry:
++	ps5RuntimeTrace("KEVENT-BEFORE", delay, int64(kq))
+ 	n := kevent(kq, nil, 0, &events[0], int32(len(events)), tp)
++	ps5RuntimeTrace("KEVENT-AFTER", int64(n), delay)
+ 	if n < 0 {
+ 		// Ignore the ETIMEDOUT error for now, but try to dive deep and
+ 		// figure out what really happened with n == ETIMEOUT,
+diff --git a/src/runtime/os_freebsd.go b/src/runtime/os_freebsd.go
+index ab859cf..813e9b5 100644
+--- a/src/runtime/os_freebsd.go
++++ b/src/runtime/os_freebsd.go
+@@ -29,10 +29,26 @@ func setitimer(mode int32, new, old *itimerval)
+ //go:noescape
+ func sysctl(mib *uint32, miblen uint32, out *byte, size *uintptr, dst *byte, ndst uintptr) int32
+ 
+-func raiseproc(sig uint32)
++func raiseprocRaw(sig uint32)
+ 
+ func thr_self() thread
+-func thr_kill(tid thread, sig int)
++func thr_kill_raw(tid thread, sig int)
++
++//go:nosplit
++func thr_kill(tid thread, sig int) {
++	if sig == _SIGSTOP {
++		ps5RuntimeSignalSendTrace(433, int64(tid), int64(sig), 0)
++	}
++	thr_kill_raw(tid, sig)
++}
++
++//go:nosplit
++func raiseproc(sig uint32) {
++	if sig == _SIGSTOP {
++		ps5RuntimeSignalSendTrace(37, -1, int64(sig), 0)
++	}
++	raiseprocRaw(sig)
++}
+ 
+ //go:noescape
+ func sys_umtx_op(addr *uint32, mode int32, val uint32, uaddr1 uintptr, ut *umtx_time) int32
+diff --git a/src/runtime/ps5_netpoll_trace.go b/src/runtime/ps5_netpoll_trace.go
+new file mode 100644
+index 0000000..673dbb0
+--- /dev/null
++++ b/src/runtime/ps5_netpoll_trace.go
+@@ -0,0 +1,116 @@
++//go:build darwin || dragonfly || freebsd || netbsd || openbsd
++
++package runtime
++
++import (
++	"internal/runtime/atomic"
++	"unsafe"
++)
++
++var ps5RuntimeTraceFD atomic.Int32
++
++func init() {
++	ps5RuntimeTraceFD.Store(-1)
++}
++
++//go:linkname runtime_setPS5PollTraceFD internal/poll.runtime_setPS5PollTraceFD
++func runtime_setPS5PollTraceFD(fd int) {
++	ps5RuntimeTraceFD.Store(int32(fd))
++}
++
++//go:nosplit
++func ps5rtAppendString(b *[192]byte, n int, s string) int {
++	for i := 0; i < len(s) && n < len(b); i++ {
++		b[n] = s[i]
++		n++
++	}
++	return n
++}
++
++//go:nosplit
++func ps5rtAppendInt(b *[192]byte, n int, v int64) int {
++	if v < 0 {
++		if n < len(b) {
++			b[n] = '-'
++			n++
++		}
++		v = -v
++	}
++	var tmp [24]byte
++	i := len(tmp)
++	if v == 0 {
++		i--
++		tmp[i] = '0'
++	} else {
++		for v > 0 && i > 0 {
++			i--
++			tmp[i] = byte('0' + v%10)
++			v /= 10
++		}
++	}
++	for ; i < len(tmp) && n < len(b); i++ {
++		b[n] = tmp[i]
++		n++
++	}
++	return n
++}
++
++//go:nosplit
++func ps5RuntimeTrace(event string, a, bval int64) {
++	if GOOS != "freebsd" {
++		return
++	}
++	fd := ps5RuntimeTraceFD.Load()
++	if fd < 0 {
++		return
++	}
++	var buf [192]byte
++	n := 0
++	n = ps5rtAppendString(&buf, n, "[AUTH152 runtime] event=")
++	n = ps5rtAppendString(&buf, n, event)
++	n = ps5rtAppendString(&buf, n, " a=")
++	n = ps5rtAppendInt(&buf, n, a)
++	n = ps5rtAppendString(&buf, n, " b=")
++	n = ps5rtAppendInt(&buf, n, bval)
++	if n < len(buf) {
++		buf[n] = '\n'
++		n++
++	}
++	if n > 0 {
++		write1(uintptr(fd), unsafe.Pointer(&buf[0]), int32(n))
++	}
++}
++
++// ps5RuntimeSignalSendTrace records every signal-producing syscall made through
++// the Go runtime or the public syscall entry points. It intentionally uses the
++// already-open direct UDP descriptor and runtime.write1 so it neither allocates
++// nor enters the ordinary Go network stack.
++//
++//go:nosplit
++//go:linkname ps5RuntimeSignalSendTrace runtime.ps5RuntimeSignalSendTrace
++func ps5RuntimeSignalSendTrace(trap, a1, a2, a3 int64) {
++	if GOOS != "freebsd" {
++		return
++	}
++	fd := ps5RuntimeTraceFD.Load()
++	if fd < 0 {
++		return
++	}
++	var buf [192]byte
++	n := 0
++	n = ps5rtAppendString(&buf, n, "[AUTH186 runtime] event=SIGNAL-SEND trap=")
++	n = ps5rtAppendInt(&buf, n, trap)
++	n = ps5rtAppendString(&buf, n, " a1=")
++	n = ps5rtAppendInt(&buf, n, a1)
++	n = ps5rtAppendString(&buf, n, " a2=")
++	n = ps5rtAppendInt(&buf, n, a2)
++	n = ps5rtAppendString(&buf, n, " a3=")
++	n = ps5rtAppendInt(&buf, n, a3)
++	if n < len(buf) {
++		buf[n] = '\n'
++		n++
++	}
++	if n > 0 {
++		write1(uintptr(fd), unsafe.Pointer(&buf[0]), int32(n))
++	}
++}
+diff --git a/src/runtime/ps5_netpoll_trace_stub.go b/src/runtime/ps5_netpoll_trace_stub.go
+new file mode 100644
+index 0000000..de31791
+--- /dev/null
++++ b/src/runtime/ps5_netpoll_trace_stub.go
+@@ -0,0 +1,10 @@
++//go:build !darwin && !dragonfly && !freebsd && !netbsd && !openbsd
++
++package runtime
++
++import _ "unsafe"
++
++//go:linkname runtime_setPS5PollTraceFD internal/poll.runtime_setPS5PollTraceFD
++func runtime_setPS5PollTraceFD(fd int) {}
++
++func ps5RuntimeTrace(event string, a, b int64) {}
+diff --git a/src/runtime/runtime1.go b/src/runtime/runtime1.go
+index 15b5467..252fdf5 100644
+--- a/src/runtime/runtime1.go
++++ b/src/runtime/runtime1.go
+@@ -437,6 +437,14 @@ func parseRuntimeDebugVars(godebug string) {
+ 	// apply environment settings
+ 	parsegodebug(godebug, nil)
+ 
++	// AUTH171: PS5 payloads are launched through an ELF-loader trace parent.
++	// Disable signal-based async preemption for FreeBSD/amd64 diagnostics so a
++	// runtime SIGURG cannot return the payload to a persistent traced stop.
++	if GOOS == "freebsd" {
++		debug.asyncpreemptoff = 1
++		print("AUTH171-ASYNC-PREEMPT-OFF\n")
++	}
++
+ 	debug.malloc = (debug.inittrace | debug.sbrk | debug.checkfinalizers) != 0
+ 	debug.profstackdepth = min(debug.profstackdepth, maxProfStackDepth)
+ 
+diff --git a/src/runtime/signal_unix.go b/src/runtime/signal_unix.go
+index 96628d6..d38d9b0 100644
+--- a/src/runtime/signal_unix.go
++++ b/src/runtime/signal_unix.go
+@@ -643,6 +643,7 @@ func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {
+ 	gsignal := getg()
+ 	mp := gsignal.m
+ 	c := &sigctxt{info, ctxt}
++	ps5RuntimeTrace("AUTH183-SIGNAL-ENTRY", int64(sig), int64(c.sigcode()))
+ 
+ 	// Cgo TSAN (not the Go race detector) intercepts signals and calls the
+ 	// signal handler at a later time. When the signal handler is called, the
+diff --git a/src/runtime/sys_freebsd_amd64.s b/src/runtime/sys_freebsd_amd64.s
+index 977ea09..b9dcd5f 100644
+--- a/src/runtime/sys_freebsd_amd64.s
++++ b/src/runtime/sys_freebsd_amd64.s
+@@ -44,7 +44,7 @@
+ #define SYS_mmap		477
+ #define SYS_cpuset_getaffinity	487
+ #define SYS_pipe2 		542
+-#define SYS_kevent		560
++#define SYS_kevent		363	// PS5/Prospero uses the legacy FreeBSD kevent ABI
+ 
+ TEXT runtime·sys_umtx_op(SB),NOSPLIT,$0
+ 	MOVQ addr+0(FP), DI
+@@ -166,7 +166,7 @@ TEXT runtime·thr_self(SB),NOSPLIT,$0-8
+ 	SYSCALL
+ 	RET
+ 
+-TEXT runtime·thr_kill(SB),NOSPLIT,$0-16
++TEXT runtime·thr_kill_raw(SB),NOSPLIT,$0-16
+ 	// thr_kill(tid, sig)
+ 	MOVQ	tid+0(FP), DI	// arg 1 id
+ 	MOVQ	sig+8(FP), SI	// arg 2 sig
+@@ -174,7 +174,7 @@ TEXT runtime·thr_kill(SB),NOSPLIT,$0-16
+ 	SYSCALL
+ 	RET
+ 
+-TEXT runtime·raiseproc(SB),NOSPLIT,$0
++TEXT runtime·raiseprocRaw(SB),NOSPLIT,$0
+ 	// getpid
+ 	MOVL	$SYS_getpid, AX
+ 	SYSCALL
+diff --git a/src/syscall/asm_unix_amd64.s b/src/syscall/asm_unix_amd64.s
+index 6d8da71..1823b7e 100644
+--- a/src/syscall/asm_unix_amd64.s
++++ b/src/syscall/asm_unix_amd64.s
+@@ -15,9 +15,40 @@
+ // func Syscall6(trap int64, a1, a2, a3, a4, a5, a6 int64) (r1, r2, err int64)
+ // Trap # in AX, args in DI SI DX, return in AX DX
+ 
+-TEXT	·Syscall(SB),NOSPLIT,$0-56
++TEXT	·Syscall(SB),NOSPLIT,$32-56
++	NO_LOCAL_POINTERS
++	MOVQ	trap+0(FP), AX
++	CMPQ	AX, $481
++	JE	traceSyscallA3
++	CMPQ	AX, $37
++	JE	traceSyscallA2
++	CMPQ	AX, $433
++	JE	traceSyscallA2
++	CMPQ	AX, $456
++	JE	traceSyscallA2
++	CMPQ	AX, $519
++	JNE	syscallTraceDone
++traceSyscallA2:
++	CMPQ	a2+16(FP), $17
++	JNE	syscallTraceDone
++	JMP	traceSyscall
++traceSyscallA3:
++	CMPQ	a3+24(FP), $17
++	JNE	syscallTraceDone
++traceSyscall:
++	MOVQ	AX, 0(SP)
++	MOVQ	a1+8(FP), CX
++	MOVQ	CX, 8(SP)
++	MOVQ	a2+16(FP), CX
++	MOVQ	CX, 16(SP)
++	MOVQ	a3+24(FP), CX
++	MOVQ	CX, 24(SP)
++	CALL	·tracePS5SignalSend(SB)
++syscallTraceDone:
+ 	CALL	runtime·entersyscall<ABIInternal>(SB)
+ 	MOVQ	trap+0(FP), AX	// syscall entry
++	CMPQ	AX, $26		// AUTH181: deny SYS_ptrace inside the Go payload
++	JE	ptraceDenied
+ 	MOVQ	a1+8(FP), DI
+ 	MOVQ	a2+16(FP), SI
+ 	MOVQ	a3+24(FP), DX
+@@ -28,6 +59,12 @@ TEXT	·Syscall(SB),NOSPLIT,$0-56
+ 	MOVQ	AX, err+48(FP)	// errno
+ 	CALL	runtime·exitsyscall<ABIInternal>(SB)
+ 	RET
++ptraceDenied:
++	MOVQ	$-1, r1+32(FP)
++	MOVQ	$0, r2+40(FP)
++	MOVQ	$1, err+48(FP)	// EPERM
++	CALL	runtime·exitsyscall<ABIInternal>(SB)
++	RET
+ ok:
+ 	MOVQ	AX, r1+32(FP)	// r1
+ 	MOVQ	DX, r2+40(FP)	// r2
+@@ -35,9 +72,40 @@ ok:
+ 	CALL	runtime·exitsyscall<ABIInternal>(SB)
+ 	RET
+ 
+-TEXT	·Syscall6(SB),NOSPLIT,$0-80
++TEXT	·Syscall6(SB),NOSPLIT,$32-80
++	NO_LOCAL_POINTERS
++	MOVQ	trap+0(FP), AX
++	CMPQ	AX, $481
++	JE	traceSyscall6A3
++	CMPQ	AX, $37
++	JE	traceSyscall6A2
++	CMPQ	AX, $433
++	JE	traceSyscall6A2
++	CMPQ	AX, $456
++	JE	traceSyscall6A2
++	CMPQ	AX, $519
++	JNE	syscall6TraceDone
++traceSyscall6A2:
++	CMPQ	a2+16(FP), $17
++	JNE	syscall6TraceDone
++	JMP	traceSyscall6
++traceSyscall6A3:
++	CMPQ	a3+24(FP), $17
++	JNE	syscall6TraceDone
++traceSyscall6:
++	MOVQ	AX, 0(SP)
++	MOVQ	a1+8(FP), CX
++	MOVQ	CX, 8(SP)
++	MOVQ	a2+16(FP), CX
++	MOVQ	CX, 16(SP)
++	MOVQ	a3+24(FP), CX
++	MOVQ	CX, 24(SP)
++	CALL	·tracePS5SignalSend(SB)
++syscall6TraceDone:
+ 	CALL	runtime·entersyscall<ABIInternal>(SB)
+ 	MOVQ	trap+0(FP), AX	// syscall entry
++	CMPQ	AX, $26		// AUTH181: deny SYS_ptrace inside the Go payload
++	JE	ptraceDenied6
+ 	MOVQ	a1+8(FP), DI
+ 	MOVQ	a2+16(FP), SI
+ 	MOVQ	a3+24(FP), DX
+@@ -51,6 +119,12 @@ TEXT	·Syscall6(SB),NOSPLIT,$0-80
+ 	MOVQ	AX, err+72(FP)  // errno
+ 	CALL	runtime·exitsyscall<ABIInternal>(SB)
+ 	RET
++ptraceDenied6:
++	MOVQ	$-1, r1+56(FP)
++	MOVQ	$0, r2+64(FP)
++	MOVQ	$1, err+72(FP)	// EPERM
++	CALL	runtime·exitsyscall<ABIInternal>(SB)
++	RET
+ ok6:
+ 	MOVQ	AX, r1+56(FP)	// r1
+ 	MOVQ	DX, r2+64(FP)	// r2
+@@ -58,37 +132,109 @@ ok6:
+ 	CALL	runtime·exitsyscall<ABIInternal>(SB)
+ 	RET
+ 
+-TEXT	·RawSyscall(SB),NOSPLIT,$0-56
++TEXT	·RawSyscall(SB),NOSPLIT,$32-56
++	NO_LOCAL_POINTERS
++	MOVQ	trap+0(FP), AX
++	CMPQ	AX, $481
++	JE	traceRawSyscallA3
++	CMPQ	AX, $37
++	JE	traceRawSyscallA2
++	CMPQ	AX, $433
++	JE	traceRawSyscallA2
++	CMPQ	AX, $456
++	JE	traceRawSyscallA2
++	CMPQ	AX, $519
++	JNE	rawSyscallTraceDone
++traceRawSyscallA2:
++	CMPQ	a2+16(FP), $17
++	JNE	rawSyscallTraceDone
++	JMP	traceRawSyscall
++traceRawSyscallA3:
++	CMPQ	a3+24(FP), $17
++	JNE	rawSyscallTraceDone
++traceRawSyscall:
++	MOVQ	AX, 0(SP)
++	MOVQ	a1+8(FP), CX
++	MOVQ	CX, 8(SP)
++	MOVQ	a2+16(FP), CX
++	MOVQ	CX, 16(SP)
++	MOVQ	a3+24(FP), CX
++	MOVQ	CX, 24(SP)
++	CALL	·tracePS5SignalSend(SB)
++rawSyscallTraceDone:
++	MOVQ	trap+0(FP), AX	// syscall entry
++	CMPQ	AX, $26		// AUTH181: deny SYS_ptrace inside the Go payload
++	JE	rawPtraceDenied
+ 	MOVQ	a1+8(FP), DI
+ 	MOVQ	a2+16(FP), SI
+ 	MOVQ	a3+24(FP), DX
+-	MOVQ	trap+0(FP), AX	// syscall entry
+ 	SYSCALL
+ 	JCC	ok1
+ 	MOVQ	$-1, r1+32(FP)	// r1
+ 	MOVQ	$0, r2+40(FP)	// r2
+ 	MOVQ	AX, err+48(FP)	// errno
+ 	RET
++rawPtraceDenied:
++	MOVQ	$-1, r1+32(FP)
++	MOVQ	$0, r2+40(FP)
++	MOVQ	$1, err+48(FP)	// EPERM
++	RET
+ ok1:
+ 	MOVQ	AX, r1+32(FP)	// r1
+ 	MOVQ	DX, r2+40(FP)	// r2
+ 	MOVQ	$0, err+48(FP)	// errno
+ 	RET
+ 
+-TEXT	·RawSyscall6(SB),NOSPLIT,$0-80
++TEXT	·RawSyscall6(SB),NOSPLIT,$32-80
++	NO_LOCAL_POINTERS
++	MOVQ	trap+0(FP), AX
++	CMPQ	AX, $481
++	JE	traceRawSyscall6A3
++	CMPQ	AX, $37
++	JE	traceRawSyscall6A2
++	CMPQ	AX, $433
++	JE	traceRawSyscall6A2
++	CMPQ	AX, $456
++	JE	traceRawSyscall6A2
++	CMPQ	AX, $519
++	JNE	rawSyscall6TraceDone
++traceRawSyscall6A2:
++	CMPQ	a2+16(FP), $17
++	JNE	rawSyscall6TraceDone
++	JMP	traceRawSyscall6
++traceRawSyscall6A3:
++	CMPQ	a3+24(FP), $17
++	JNE	rawSyscall6TraceDone
++traceRawSyscall6:
++	MOVQ	AX, 0(SP)
++	MOVQ	a1+8(FP), CX
++	MOVQ	CX, 8(SP)
++	MOVQ	a2+16(FP), CX
++	MOVQ	CX, 16(SP)
++	MOVQ	a3+24(FP), CX
++	MOVQ	CX, 24(SP)
++	CALL	·tracePS5SignalSend(SB)
++rawSyscall6TraceDone:
++	MOVQ	trap+0(FP), AX	// syscall entry
++	CMPQ	AX, $26		// AUTH181: deny SYS_ptrace inside the Go payload
++	JE	rawPtraceDenied6
+ 	MOVQ	a1+8(FP), DI
+ 	MOVQ	a2+16(FP), SI
+ 	MOVQ	a3+24(FP), DX
+ 	MOVQ	a4+32(FP), R10
+ 	MOVQ	a5+40(FP), R8
+ 	MOVQ	a6+48(FP), R9
+-	MOVQ	trap+0(FP), AX	// syscall entry
+ 	SYSCALL
+ 	JCC	ok2
+ 	MOVQ	$-1, r1+56(FP)	// r1
+ 	MOVQ	$0, r2+64(FP)	// r2
+ 	MOVQ	AX, err+72(FP)	// errno
+ 	RET
++rawPtraceDenied6:
++	MOVQ	$-1, r1+56(FP)
++	MOVQ	$0, r2+64(FP)
++	MOVQ	$1, err+72(FP)	// EPERM
++	RET
+ ok2:
+ 	MOVQ	AX, r1+56(FP)	// r1
+ 	MOVQ	DX, r2+64(FP)	// r2
+diff --git a/src/syscall/syscall_freebsd.go b/src/syscall/syscall_freebsd.go
+index 584522d..ae9687a 100644
+--- a/src/syscall/syscall_freebsd.go
++++ b/src/syscall/syscall_freebsd.go
+@@ -19,6 +19,14 @@ func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
+ func RawSyscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno)
+ func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
+ 
++//go:linkname runtime_ps5SignalSendTrace runtime.ps5RuntimeSignalSendTrace
++func runtime_ps5SignalSendTrace(trap, a1, a2, a3 int64)
++
++//go:nosplit
++func tracePS5SignalSend(trap, a1, a2, a3 uintptr) {
++	runtime_ps5SignalSendTrace(int64(trap), int64(a1), int64(a2), int64(a3))
++}
++
+ type SockaddrDatalink struct {
+ 	Len    uint8
+ 	Family uint8
+diff --git a/src/syscall/zsysnum_freebsd_amd64.go b/src/syscall/zsysnum_freebsd_amd64.go
+index 348bcd0..bdbe50b 100644
+--- a/src/syscall/zsysnum_freebsd_amd64.go
++++ b/src/syscall/zsysnum_freebsd_amd64.go
+@@ -337,8 +337,8 @@ const (
+ 	SYS_PIPE2                    = 542 // { int pipe2(int *fildes, int flags); }
+ 	SYS_PROCCTL                  = 544 // { int procctl(idtype_t idtype, id_t id, \
+ 	SYS_UTIMENSAT                = 547 // { int utimensat(int fd, \
+-	SYS_FSTAT                    = 551 // { int fstat(int fd, _Out_ struct stat *sb); }
+-	SYS_FSTATAT                  = 552 // { int fstatat(int fd, _In_z_ char *path, \
++	SYS_FSTAT                    = 189 // PS5/Prospero legacy FreeBSD ABI
++	SYS_FSTATAT                  = 493 // PS5/Prospero legacy FreeBSD ABI
+ 	SYS_GETDIRENTRIES            = 554 // { ssize_t getdirentries(int fd, \
+ 	SYS_STATFS                   = 555 // { int statfs(_In_z_ char *path, \
+ 	SYS_FSTATFS                  = 556 // { int fstatfs(int fd, \
+diff --git a/src/syscall/ztypes_freebsd_amd64.go b/src/syscall/ztypes_freebsd_amd64.go
+index 3f97d1e..58a677d 100644
+--- a/src/syscall/ztypes_freebsd_amd64.go
++++ b/src/syscall/ztypes_freebsd_amd64.go
+@@ -79,25 +79,23 @@ const (
+ )
+ 
+ type Stat_t struct {
+-	Dev           uint64
+-	Ino           uint64
+-	Nlink         uint64
++	Dev           uint32
++	Ino           uint32
+ 	Mode          uint16
+-	Padding0      int16
++	Nlink         uint16
+ 	Uid           uint32
+ 	Gid           uint32
+-	Padding1      int32
+-	Rdev          uint64
++	Rdev          uint32
+ 	Atimespec     Timespec
+ 	Mtimespec     Timespec
+ 	Ctimespec     Timespec
+-	Birthtimespec Timespec
+ 	Size          int64
+ 	Blocks        int64
+ 	Blksize       int32
+ 	Flags         uint32
+-	Gen           uint64
+-	Spare         [10]uint64
++	Gen           uint32
++	Lspare        int32
++	Birthtimespec Timespec
+ }
+ 
+ type Statfs_t struct {

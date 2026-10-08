@@ -1,0 +1,6 @@
+[submodule "third_party/libtailscale"]
+	path = third_party/libtailscale
+	url = https://github.com/tailscale/libtailscale.git
+[submodule "third_party/ps5debug-NG"]
+	path = third_party/ps5debug-NG
+	url = https://github.com/OpenSourcereR-dev/ps5debug-NG.git

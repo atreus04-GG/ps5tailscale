@@ -1,0 +1,679 @@
+diff --git a/ps5_delayed_probe.go b/ps5_delayed_probe.go
+new file mode 100644
+index 0000000..38b3618
+--- /dev/null
++++ b/ps5_delayed_probe.go
+@@ -0,0 +1,91 @@
++package main
++
++/*
++#include "errno.h"
++void tsp5_go_lib_stage(int stage);
++*/
++import "C"
++
++import (
++	"io"
++	"net"
++	"time"
++)
++
++//export TsnetPS5DelayedTCPServerProbe
++func TsnetPS5DelayedTCPServerProbe(timeoutMS C.int) C.int {
++	timeout := time.Duration(int(timeoutMS)) * time.Millisecond
++	C.tsp5_go_lib_stage(201)
++
++	ln, err := net.Listen("tcp", "0.0.0.0:19001")
++	if err != nil {
++		C.tsp5_go_lib_stage(291)
++		return -1
++	}
++	defer ln.Close()
++
++	C.tsp5_go_lib_stage(202)
++	if tl, ok := ln.(*net.TCPListener); ok {
++		_ = tl.SetDeadline(time.Now().Add(timeout))
++	}
++
++	conn, err := ln.Accept()
++	if err != nil {
++		C.tsp5_go_lib_stage(292)
++		return -2
++	}
++	defer conn.Close()
++
++	C.tsp5_go_lib_stage(203)
++	_ = conn.SetDeadline(time.Now().Add(timeout))
++
++	buf := make([]byte, 4)
++	C.tsp5_go_lib_stage(204)
++	if _, err := io.ReadFull(conn, buf); err != nil {
++		C.tsp5_go_lib_stage(293)
++		return -3
++	}
++
++	C.tsp5_go_lib_stage(205)
++	if string(buf) != "WAKE" {
++		C.tsp5_go_lib_stage(294)
++		return -4
++	}
++
++	C.tsp5_go_lib_stage(206)
++	return 0
++}
++
++//export TsnetPS5DelayedTCPClientProbe
++func TsnetPS5DelayedTCPClientProbe(addr *C.char, timeoutMS C.int) C.int {
++	target := C.GoString(addr)
++	timeout := time.Duration(int(timeoutMS)) * time.Millisecond
++	C.tsp5_go_lib_stage(211)
++
++	dialer := net.Dialer{Timeout: timeout}
++	conn, err := dialer.Dial("tcp6", target)
++	if err != nil {
++		C.tsp5_go_lib_stage(295)
++		return -1
++	}
++	defer conn.Close()
++
++	C.tsp5_go_lib_stage(212)
++	_ = conn.SetDeadline(time.Now().Add(timeout))
++
++	buf := make([]byte, 4)
++	C.tsp5_go_lib_stage(213)
++	if _, err := io.ReadFull(conn, buf); err != nil {
++		C.tsp5_go_lib_stage(296)
++		return -2
++	}
++
++	C.tsp5_go_lib_stage(214)
++	if string(buf) != "WAKE" {
++		C.tsp5_go_lib_stage(297)
++		return -3
++	}
++
++	C.tsp5_go_lib_stage(215)
++	return 0
++}
+diff --git a/ps5_timer_heartbeat.go b/ps5_timer_heartbeat.go
+new file mode 100644
+index 0000000..50982e5
+--- /dev/null
++++ b/ps5_timer_heartbeat.go
+@@ -0,0 +1,20 @@
++package main
++
++/*
++void tsp5_go_lib_stage(int stage);
++*/
++import "C"
++
++import "time"
++
++//export TsnetPS5StartTimerHeartbeat
++func TsnetPS5StartTimerHeartbeat() C.int {
++	go func() {
++		C.tsp5_go_lib_stage(311)
++		for i := 0; i < 12; i++ {
++			time.Sleep(5 * time.Second)
++			C.tsp5_go_lib_stage(C.int(312 + i))
++		}
++	}()
++	return 0
++}
+diff --git a/ps5_timer_probe.go b/ps5_timer_probe.go
+new file mode 100644
+index 0000000..f30b215
+--- /dev/null
++++ b/ps5_timer_probe.go
+@@ -0,0 +1,16 @@
++package main
++
++/*
++void tsp5_go_lib_stage(int stage);
++*/
++import "C"
++
++import "time"
++
++//export TsnetPS5TimerSleepProbe
++func TsnetPS5TimerSleepProbe(ms C.int) C.int {
++	C.tsp5_go_lib_stage(301)
++	time.Sleep(time.Duration(int(ms)) * time.Millisecond)
++	C.tsp5_go_lib_stage(302)
++	return 0
++}
+diff --git a/tailscale.c b/tailscale.c
+index 420d67e..1e4d7ce 100644
+--- a/tailscale.c
++++ b/tailscale.c
+@@ -10,6 +10,8 @@
+ extern int TsnetNewServer();
+ extern int TsnetStart(int sd);
+ extern int TsnetUp(int sd);
++extern int TsnetDown(int sd);
++extern int TsnetSetRunning(int sd, int want);
+ extern int TsnetClose(int sd);
+ extern int TsnetErrmsg(int sd, char* buf, size_t buflen);
+ extern int TsnetDial(int sd, char* net, char* addr, int* connOut);
+@@ -21,6 +23,7 @@ extern int TsnetSetEphemeral(int sd, int ephemeral);
+ extern int TsnetSetLogFD(int sd, int fd);
+ extern int TsnetGetIps(int sd, char *buf, size_t buflen);
+ extern int TsnetGetRemoteAddr(int listener, int conn, char *buf, size_t buflen);
++extern int TsnetPS5StartRemotePlayProxy(int sd, char* target_ip);
+ extern int TsnetListen(int sd, char* net, char* addr, int* listenerOut);
+ extern int TsnetAccept(int ld, int* connOut);
+ extern int TsnetLoopback(int sd, char* addrOut, size_t addrLen, char* proxyOut, char* localOut);
+@@ -39,6 +42,14 @@ int tailscale_up(tailscale sd) {
+ 	return TsnetUp(sd);
+ }
+ 
++int tailscale_down(tailscale sd) {
++	return TsnetDown(sd);
++}
++
++int tailscale_set_running(tailscale sd, int want) {
++	return TsnetSetRunning(sd, want);
++}
++
+ int tailscale_close(tailscale sd) {
+ 	return TsnetClose(sd);
+ }
+@@ -59,6 +70,10 @@ int tailscale_getremoteaddr(tailscale_listener l, tailscale_conn conn, char* buf
+ 	return TsnetGetRemoteAddr(l, conn, buf, buflen);
+ }
+ 
++int tailscale_ps5_start_remoteplay_proxy(tailscale sd, const char* target_ip) {
++	return TsnetPS5StartRemotePlayProxy(sd, (char*)target_ip);
++}
++
+ int tailscale_getips(tailscale sd, char* buf, size_t buflen) {
+ 	return TsnetGetIps(sd, buf, buflen);
+ }
+diff --git a/tailscale.go b/tailscale.go
+index 316efdd..dac3eff 100644
+--- a/tailscale.go
++++ b/tailscale.go
+@@ -5,6 +5,7 @@
+ package main
+ 
+ //#include "errno.h"
++// void tsp5_go_lib_stage(int stage);
+ import "C"
+ 
+ import (
+@@ -14,15 +15,19 @@ import (
+ 	"io"
+ 	"net"
+ 	"os"
++	"os/signal"
+ 	"regexp"
++	"runtime"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"syscall"
+ 	"time"
+ 	"unsafe"
+ 
+ 	"golang.org/x/sys/unix"
++	"tailscale.com/control/controlhttp"
+ 	"tailscale.com/hostinfo"
+ 	"tailscale.com/ipn"
+ 	"tailscale.com/tsnet"
+@@ -31,6 +36,34 @@ import (
+ 
+ func main() {}
+ 
++var ps5DisableListenerCloseWatch bool
++
++var ps5SignalPolicyOnce sync.Once
++
++//export TsnetPS5SetDisableListenerCloseWatch
++func TsnetPS5SetDisableListenerCloseWatch(enabled C.int) C.int {
++	ps5DisableListenerCloseWatch = enabled != 0
++	return 0
++}
++
++//export TsnetPS5SetForceNoiseIPv4
++func TsnetPS5SetForceNoiseIPv4(enabled C.int) C.int {
++	controlhttp.SetForceNoiseIPv4ForTest(enabled != 0)
++	return 0
++}
++
++//export TsnetPS5SetTraceRawControl
++func TsnetPS5SetTraceRawControl(enabled C.int) C.int {
++	controlhttp.SetTraceRawConnForTest(enabled != 0)
++	return 0
++}
++
++//export TsnetPS5SetPollTraceFD
++func TsnetPS5SetPollTraceFD(fd C.int) C.int {
++	net.SetPS5PollTraceFDForTest(int(fd))
++	return 0
++}
++
+ // servers tracks all the allocated *tsnet.Server objects.
+ var servers struct {
+ 	mu   sync.Mutex
+@@ -42,6 +75,12 @@ type server struct {
+ 	s       *tsnet.Server
+ 	lastErr string
+ 	started bool
++
++	remotePlayMu          sync.Mutex
++	remotePlayStarted     bool
++	remotePlayTargetIP    string
++	remotePlayListeners   []net.Listener
++	remotePlayPacketConns []net.PacketConn
+ }
+ 
+ func getServer(sd C.int) *server {
+@@ -50,6 +89,250 @@ func getServer(sd C.int) *server {
+ 	return servers.m[sd]
+ }
+ 
++type remotePlayProxySpec struct {
++	network string
++	port    int
++}
++
++var remotePlayProxySpecs = []remotePlayProxySpec{
++	{network: "tcp", port: 9295},
++	{network: "udp", port: 9295},
++	{network: "udp", port: 9296},
++	{network: "udp", port: 9297},
++	{network: "udp", port: 9302},
++}
++
++type remotePlayUDPStats struct {
++	clientRxPackets atomic.Uint64
++	clientRxBytes   atomic.Uint64
++	ps5TxPackets    atomic.Uint64
++	ps5RxPackets    atomic.Uint64
++	ps5RxBytes      atomic.Uint64
++	clientTxPackets atomic.Uint64
++	clientTxBytes   atomic.Uint64
++	dropped         atomic.Uint64
++}
++
++type remotePlayUDPFlow struct {
++	backend *net.UDPConn
++	client  net.Addr
++	lastUse time.Time
++}
++
++func (s *server) remotePlayLogf(format string, args ...any) {
++	if s.s != nil && s.s.Logf != nil {
++		s.s.Logf("[REMOTEPLAY_PROXY] "+format, args...)
++	}
++}
++
++func (s *server) proxyRemotePlayTCPFlow(port int, tailConn net.Conn, targetIP string) {
++	target := net.JoinHostPort(targetIP, strconv.Itoa(port))
++	backend, err := net.Dial("tcp", target)
++	if err != nil {
++		s.remotePlayLogf("backend dial failed network=tcp port=%d target=%s err=%v", port, target, err)
++		tailConn.Close()
++		return
++	}
++	s.remotePlayLogf("flow open network=tcp port=%d remote=%s target=%s", port, tailConn.RemoteAddr(), target)
++	defer func() {
++		backend.Close()
++		tailConn.Close()
++		s.remotePlayLogf("flow closed network=tcp port=%d remote=%s", port, tailConn.RemoteAddr())
++	}()
++
++	done := make(chan struct{}, 2)
++	go func() {
++		_, _ = io.Copy(backend, tailConn)
++		done <- struct{}{}
++	}()
++	go func() {
++		_, _ = io.Copy(tailConn, backend)
++		done <- struct{}{}
++	}()
++	<-done
++}
++
++func (s *server) serveRemotePlayTCPListener(port int, ln net.Listener, targetIP string) {
++	for {
++		c, err := ln.Accept()
++		if err != nil {
++			s.remotePlayLogf("listener stopped network=tcp port=%d err=%v", port, err)
++			return
++		}
++		go s.proxyRemotePlayTCPFlow(port, c, targetIP)
++	}
++}
++
++func (s *server) runRemotePlayUDPStats(port int, stats *remotePlayUDPStats) {
++	ticker := time.NewTicker(5 * time.Second)
++	defer ticker.Stop()
++	for range ticker.C {
++		clientRxPackets := stats.clientRxPackets.Load()
++		clientRxBytes := stats.clientRxBytes.Load()
++		ps5TxPackets := stats.ps5TxPackets.Load()
++		ps5RxPackets := stats.ps5RxPackets.Load()
++		ps5RxBytes := stats.ps5RxBytes.Load()
++		clientTxPackets := stats.clientTxPackets.Load()
++		clientTxBytes := stats.clientTxBytes.Load()
++		dropped := stats.dropped.Load()
++		s.remotePlayLogf("udp stats port=%d client_rx=%d/%d ps5_tx=%d ps5_rx=%d/%d client_tx=%d/%d dropped=%d",
++			port,
++			clientRxPackets, clientRxBytes,
++			ps5TxPackets,
++			ps5RxPackets, ps5RxBytes,
++			clientTxPackets, clientTxBytes,
++			dropped)
++	}
++}
++
++func (s *server) relayRemotePlayUDPReplies(port int, tailPC net.PacketConn, flow *remotePlayUDPFlow, stats *remotePlayUDPStats) {
++	buf := make([]byte, 65535)
++	for {
++		n, err := flow.backend.Read(buf)
++		if err != nil {
++			return
++		}
++		stats.ps5RxPackets.Add(1)
++		stats.ps5RxBytes.Add(uint64(n))
++		if _, err := tailPC.WriteTo(buf[:n], flow.client); err != nil {
++			stats.dropped.Add(1)
++			continue
++		}
++		stats.clientTxPackets.Add(1)
++		stats.clientTxBytes.Add(uint64(n))
++	}
++}
++
++func (s *server) serveRemotePlayUDP(port int, tailPC net.PacketConn, targetIP string) {
++	targetAddr, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(targetIP, strconv.Itoa(port)))
++	if err != nil {
++		s.remotePlayLogf("udp target resolve failed port=%d target=%s err=%v", port, targetIP, err)
++		return
++	}
++
++	stats := &remotePlayUDPStats{}
++	go s.runRemotePlayUDPStats(port, stats)
++
++	var mu sync.Mutex
++	flows := map[string]*remotePlayUDPFlow{}
++	buf := make([]byte, 65535)
++
++	for {
++		n, clientAddr, err := tailPC.ReadFrom(buf)
++		if err != nil {
++			s.remotePlayLogf("udp listener stopped port=%d err=%v", port, err)
++			return
++		}
++		stats.clientRxPackets.Add(1)
++		stats.clientRxBytes.Add(uint64(n))
++
++		key := clientAddr.String()
++		now := time.Now()
++
++		mu.Lock()
++		flow := flows[key]
++		if flow != nil && now.Sub(flow.lastUse) > 60*time.Second {
++			_ = flow.backend.Close()
++			delete(flows, key)
++			flow = nil
++		}
++		if flow == nil {
++			backend, dialErr := net.DialUDP("udp4", nil, targetAddr)
++			if dialErr != nil {
++				mu.Unlock()
++				stats.dropped.Add(1)
++				s.remotePlayLogf("udp backend dial failed port=%d client=%s target=%s err=%v", port, key, targetAddr, dialErr)
++				continue
++			}
++			flow = &remotePlayUDPFlow{backend: backend, client: clientAddr, lastUse: now}
++			flows[key] = flow
++			go s.relayRemotePlayUDPReplies(port, tailPC, flow, stats)
++			s.remotePlayLogf("udp flow open port=%d client=%s target=%s", port, key, targetAddr)
++		} else {
++			flow.lastUse = now
++		}
++		backend := flow.backend
++		mu.Unlock()
++
++		if _, err := backend.Write(buf[:n]); err != nil {
++			stats.dropped.Add(1)
++			continue
++		}
++		stats.ps5TxPackets.Add(1)
++	}
++}
++
++//export TsnetPS5StartRemotePlayProxy
++func TsnetPS5StartRemotePlayProxy(sd C.int, targetIPC *C.char) C.int {
++	s := getServer(sd)
++	if s == nil {
++		return C.EBADF
++	}
++	targetIP := strings.TrimSpace(C.GoString(targetIPC))
++	if net.ParseIP(targetIP) == nil {
++		return s.recErr(fmt.Errorf("invalid Remote Play proxy target IP %q", targetIP))
++	}
++
++	s.remotePlayMu.Lock()
++	defer s.remotePlayMu.Unlock()
++	if s.remotePlayStarted {
++		if s.remotePlayTargetIP == targetIP {
++			s.remotePlayLogf("already started target=%s", targetIP)
++			return 0
++		}
++		return s.recErr(fmt.Errorf("Remote Play proxy already started for %s", s.remotePlayTargetIP))
++	}
++
++	ip4, _ := s.s.TailscaleIPs()
++	if !ip4.IsValid() {
++		return s.recErr(fmt.Errorf("Remote Play proxy has no Tailscale IPv4"))
++	}
++
++	startedTCP := make([]net.Listener, 0, 1)
++	startedUDP := make([]net.PacketConn, 0, 4)
++	for _, spec := range remotePlayProxySpecs {
++		if spec.network == "tcp" {
++			addr := ":" + strconv.Itoa(spec.port)
++			ln, err := s.s.Listen("tcp", addr)
++			if err != nil {
++				for _, prior := range startedTCP {
++					_ = prior.Close()
++				}
++				for _, prior := range startedUDP {
++					_ = prior.Close()
++				}
++				return s.recErr(fmt.Errorf("Remote Play proxy listen tcp %s: %w", addr, err))
++			}
++			startedTCP = append(startedTCP, ln)
++			s.remotePlayLogf("listener ready network=tcp port=%d target=%s", spec.port, targetIP)
++			go s.serveRemotePlayTCPListener(spec.port, ln, targetIP)
++			continue
++		}
++
++		addr := net.JoinHostPort(ip4.String(), strconv.Itoa(spec.port))
++		pc, err := s.s.ListenPacket("udp4", addr)
++		if err != nil {
++			for _, prior := range startedTCP {
++				_ = prior.Close()
++			}
++			for _, prior := range startedUDP {
++				_ = prior.Close()
++			}
++			return s.recErr(fmt.Errorf("Remote Play proxy listen udp4 %s: %w", addr, err))
++		}
++		startedUDP = append(startedUDP, pc)
++		s.remotePlayLogf("packet listener ready network=udp4 port=%d tailnet=%s target=%s", spec.port, ip4, targetIP)
++		go s.serveRemotePlayUDP(spec.port, pc, targetIP)
++	}
++
++	s.remotePlayListeners = startedTCP
++	s.remotePlayPacketConns = startedUDP
++	s.remotePlayTargetIP = targetIP
++	s.remotePlayStarted = true
++	s.remotePlayLogf("ready target=%s tcp=9295 udp-packet=9295,9296,9297,9302", targetIP)
++	return 0
++}
++
+ // listeners tracks all the tsnet_listener objects allocated via tsnet_listen.
+ var listeners struct {
+ 	mu sync.Mutex
+@@ -87,20 +370,34 @@ func (s *server) recErr(err error) C.int {
+ 
+ //export TsnetNewServer
+ func TsnetNewServer() C.int {
++	if runtime.GOOS == "freebsd" {
++		oldProcs := runtime.GOMAXPROCS(2)
++		C.tsp5_go_lib_stage(C.int(1800 + oldProcs))
++		C.tsp5_go_lib_stage(1902)
++	}
++	C.tsp5_go_lib_stage(101)
+ 	servers.mu.Lock()
++	C.tsp5_go_lib_stage(102)
+ 	defer servers.mu.Unlock()
+ 
+ 	if servers.m == nil {
++		C.tsp5_go_lib_stage(103)
+ 		servers.m = map[C.int]*server{}
++		C.tsp5_go_lib_stage(104)
+ 		hostinfo.SetApp("libtailscale")
++		C.tsp5_go_lib_stage(105)
+ 	}
+ 	if servers.next == 0 {
++		C.tsp5_go_lib_stage(106)
+ 		servers.next = 42<<16 + 1
+ 	}
+ 	sd := servers.next
++	C.tsp5_go_lib_stage(107)
+ 	servers.next++
+ 	s := &server{s: &tsnet.Server{}}
++	C.tsp5_go_lib_stage(108)
+ 	servers.m[sd] = s
++	C.tsp5_go_lib_stage(109)
+ 	return (C.int)(sd)
+ }
+ 
+@@ -110,6 +407,12 @@ func TsnetStart(sd C.int) C.int {
+ 	if s == nil {
+ 		return C.EBADF
+ 	}
++	if runtime.GOOS == "freebsd" {
++		ps5SignalPolicyOnce.Do(func() {
++			signal.Ignore(syscall.SIGPIPE)
++			C.tsp5_go_lib_stage(1910)
++		})
++	}
+ 	err := s.s.Start()
+ 	if err == nil {
+ 		s.started = true
+@@ -119,17 +422,45 @@ func TsnetStart(sd C.int) C.int {
+ 
+ //export TsnetUp
+ func TsnetUp(sd C.int) C.int {
++	C.tsp5_go_lib_stage(201)
+ 	s := getServer(sd)
++	C.tsp5_go_lib_stage(202)
+ 	if s == nil {
+ 		return C.EBADF
+ 	}
++	C.tsp5_go_lib_stage(203)
+ 	_, err := s.s.Up(context.Background()) // cancellation is via TsnetClose
++	C.tsp5_go_lib_stage(204)
+ 	if err == nil {
+ 		s.started = true
+ 	}
+ 	return s.recErr(err)
+ }
+ 
++//export TsnetSetRunning
++func TsnetSetRunning(sd C.int, want C.int) C.int {
++	s := getServer(sd)
++	if s == nil {
++		return C.EBADF
++	}
++	lc, err := s.s.LocalClient()
++	if err != nil {
++		return s.recErr(err)
++	}
++	_, err = lc.EditPrefs(context.Background(), &ipn.MaskedPrefs{
++		Prefs: ipn.Prefs{
++			WantRunning: want != 0,
++		},
++		WantRunningSet: true,
++	})
++	return s.recErr(err)
++}
++
++//export TsnetDown
++func TsnetDown(sd C.int) C.int {
++	return TsnetSetRunning(sd, 0)
++}
++
+ //export TsnetClose
+ func TsnetClose(sd C.int) C.int {
+ 	servers.mu.Lock()
+@@ -259,16 +590,19 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
+ 
+ 		ln.Close()
+ 	}
+-	go func() {
+-		// fdC is never written to, so trying to read from sp blocks
+-		// until fdC is closed. We use this as a signal that C is
+-		// done with the listener, and we can tear it down.
+-		//
+-		// TODO: would using os.NewFile avoid a locked up thread?
+-		var buf [256]byte
+-		syscall.Read(sp, buf[:])
+-		cleanup()
+-	}()
++	if !ps5DisableListenerCloseWatch {
++		go func() {
++			// fdC is never written to, so trying to read from sp blocks
++			// until fdC is closed. We use this as a signal that C is
++			// done with the listener, and we can tear it down.
++			//
++			// This raw blocking read is intentionally disabled by AUTH139
++			// on PS5 to test whether it starves the embedded Go runtime.
++			var buf [256]byte
++			syscall.Read(sp, buf[:])
++			cleanup()
++		}()
++	}
+ 	go func() {
+ 		defer cleanup()
+ 		for {
+diff --git a/tailscale.h b/tailscale.h
+index 9bc8e7c..da08a57 100644
+--- a/tailscale.h
++++ b/tailscale.h
+@@ -47,6 +47,15 @@ extern int tailscale_start(tailscale sd);
+ // Returns zero on success or -1 on error, call tailscale_errmsg for details.
+ extern int tailscale_up(tailscale sd);
+ 
++// tailscale_down disconnects the server from the tailnet while keeping
++// the server object alive so it can be brought back with tailscale_up.
++// Returns zero on success or -1 on error.
++extern int tailscale_down(tailscale sd);
++
++// tailscale_set_running changes WantRunning without destroying the server.
++// Pass 0 to disconnect and non-zero to request reconnection.
++extern int tailscale_set_running(tailscale sd, int want);
++
+ // tailscale_close shuts down the server.
+ //
+ // Returns:
+@@ -139,6 +148,11 @@ extern int tailscale_listen(tailscale sd, const char* network, const char* addr,
+ // 	ERANGE - insufficient storage for buf
+ extern int tailscale_getremoteaddr(tailscale_listener l, tailscale_conn conn, char* buf, size_t buflen);
+ 
++// tailscale_ps5_start_remoteplay_proxy exposes PS5 Remote Play over the
++// tsnet userspace node and forwards accepted flows to target_ip on the
++// native PS5 network stack. Current ports: TCP/9295 and UDP/9295,9296,9297,9302.
++extern int tailscale_ps5_start_remoteplay_proxy(tailscale sd, const char* target_ip);
++
+ 
+ // tailscale_accept accepts a connection on a tailscale_listener.
+ //
